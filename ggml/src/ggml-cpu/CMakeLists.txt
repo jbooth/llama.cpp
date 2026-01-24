@@ -41,6 +41,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/amx/amx.h
         ggml-cpu/amx/mmq.cpp
         ggml-cpu/amx/mmq.h
+        ggml-cpu/tiled/tiled.cpp
+        ggml-cpu/tiled/tiled.h
         ggml-cpu/ggml-cpu-impl.h
         ggml-cpu/common.h
         ggml-cpu/binary-ops.h

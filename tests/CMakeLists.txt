@@ -107,6 +107,14 @@ function(llama_build_and_test source)
     endif()
     target_link_libraries(${TEST_TARGET} PRIVATE llama-common)
 
+    # Include hints for intellij
+    target_include_directories(${TEST_TARGET} PUBLIC
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/ggml/include
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
     add_test(
         NAME ${TEST_TARGET}
         WORKING_DIRECTORY ${LLAMA_TEST_WORKING_DIRECTORY}
@@ -288,8 +296,10 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-backend-ops.cpp)
 
+llama_build_and_test(test-gguf.cpp)
+llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-jb-harness.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
