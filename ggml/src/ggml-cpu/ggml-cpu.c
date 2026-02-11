@@ -1840,7 +1840,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_TILED:
             {
-                ggml_compute_forward_mul_mat_tiled_implicit(params, tensor);
+                ggml_compute_forward_mul_mat_tiled(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-void ggml_compute_forward_mul_mat_tiled_implicit(
+void ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst);
 #ifdef __cplusplus

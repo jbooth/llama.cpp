@@ -13,20 +13,9 @@ static float * gen_rand_f32(int64_t n) {
     float * data = (float *) malloc(n * sizeof(float));
     for (int64_t i = 0; i < n; ++i) {
         data[i] = (float)rand() / (float)RAND_MAX - 0.5f;
+        data[i] *= 5.0f;
     }
     return data;
-}
-
-static void matmul_ref(float *C, const float *A, const float *B, int64_t M, int64_t N, int64_t K) {
-    for (int64_t i = 0; i < M; ++i) {
-        for (int64_t j = 0; j < K; ++j) {
-            float acc = 0.0f;
-            for (int64_t k = 0; k < N; ++k) {
-                acc += A[i*N + k] * B[k*K + j];
-            }
-            C[i*K + j] = acc;
-        }
-    }
 }
 
 static void compare_f32(const float * ref, const float * out, int64_t n, float * max_err, float * rms_err) {
@@ -34,7 +23,10 @@ static void compare_f32(const float * ref, const float * out, int64_t n, float *
     double sum_sq_err = 0.0;
     for (int64_t i = 0; i < n; ++i) {
         float err = fabsf(ref[i] - out[i]);
-        if (err > *max_err) *max_err = err;
+        if (err > *max_err) {
+            printf("New max err %f  ref %f out %f \n", *max_err, ref[i], out[i]);
+            *max_err = err;
+        }
         sum_sq_err += (double)err * err;
     }
     *rms_err = sqrt(sum_sq_err / n);
@@ -77,10 +69,8 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
 
     float * A_ref = gen_rand_f32(M * N);
     float * B_ref = gen_rand_f32(N * K);
-    float * C_ref = (float *) malloc(M * K * sizeof(float));
     float * C_out = (float *) malloc(M * K * sizeof(float));
-
-    matmul_ref(C_ref, A_ref, B_ref, M, N, K);
+    float * C_tiled = (float *) malloc(M * K * sizeof(float));
 
     struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
     struct ggml_context * ctx = ggml_init(ip);
@@ -95,9 +85,13 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
     struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
 
-    struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    struct ggml_tensor * C = ggml_mul_mat_tiled(ctx, Bq, A);
+    struct ggml_cgraph * gf  = ggml_new_graph(ctx);
+    struct ggml_tensor * C   = ggml_mul_mat(ctx, Bq, A);
     ggml_build_forward_expand(gf, C);
+
+    struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
+    struct ggml_tensor * C_t   = ggml_mul_mat_tiled(ctx, Bq, A);
+    ggml_build_forward_expand(gf_t, C_t);
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
@@ -116,22 +110,45 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     fill_tensor(Bq, B_ref_T, K, N, quant_type);
 
     ggml_backend_graph_compute(backend, gf);
+    ggml_backend_graph_compute(backend, gf_t);
 
     // C is (K, M). Result C_ref is (M, K). Read rows of C into C_out.
     for (int64_t i = 0; i < M; ++i) {
-        ggml_backend_tensor_get(C, C_out + i*K, i * C->nb[1], K * sizeof(float));
+        ggml_backend_tensor_get(C,   C_out + i*K,   i * C->nb[1], K * sizeof(float));
+        ggml_backend_tensor_get(C_t, C_tiled + i*K,   i * C_t->nb[1], K * sizeof(float));
     }
 
-    float max_err, rms_err;
-    compare_f32(C_ref, C_out, M*K, &max_err, &rms_err);
-    float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : 0.5f;
+    // max |C|: used as scale for quantization tolerance
+    float scale = 0.0f;
+    for (int64_t i = 0; i < M*K; ++i) {
+        scale = fmaxf(scale, fabsf(C_out[i]));
+    }
 
-    printf("TEST %lldx%lld * %lldx%lld (%s): %s (max_err: %f)\n",
+    // std vs tiled: identical quantized inputs, so any large difference here is a bug in the tiled kernel
+    float max_err, rms_err;
+    compare_f32(C_out, C_tiled, M*K, &max_err, &rms_err);
+    float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : fmaxf(1e-3f, 1e-3f * scale);
+
+    printf("TEST %lldx%lld * %lldx%lld (%s): %s (max_err: %f, rms: %f, scale: %f)\n",
            (long long)M, (long long)N, (long long)N, (long long)K,
-           ggml_type_name(quant_type), (max_err <= tol) ? "PASS" : "FAIL", max_err);
+           ggml_type_name(quant_type), (max_err <= tol) ? "PASS" : "FAIL", max_err, rms_err, scale);
+
+    // if the tiled kernel deviates from std beyond quantization tolerance, dump a few offenders
+    if (max_err > tol) {
+        int64_t shown = 0;
+        for (int64_t i = 0; i < M*K && shown < 8; ++i) {
+            float err = fabsf(C_out[i] - C_tiled[i]);
+            if (err > tol) {
+                printf("  tiled vs std: i=%lld (m=%lld k=%lld) std=%f tiled=%f err=%f\n",
+                       (long long)i, (long long)(i/K), (long long)(i%K), C_out[i], C_tiled[i], err);
+                ++shown;
+            }
+        }
+    }
 
     ggml_free(ctx);
-    free(A_ref); free(B_ref); free(B_ref_T); free(C_ref); free(C_out);
+    free(A_ref); free(B_ref); free(B_ref_T); free(C_out); free(C_tiled);
+    //if (max_err > tol) { exit(1); }
 }
 
 void bench_matmul(ggml_backend_t backend, int64_t dim, ggml_type quant_type) {
@@ -208,6 +225,14 @@ void bench_matmul(ggml_backend_t backend, int64_t dim, ggml_type quant_type) {
     for (int i = 0; i < num_iterations; ++i) free(B_datas[i]);
     free(B_datas); free(B_tensors); free(A_data);
     ggml_free(ctx);
+}
+
+static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ggml_backend_graph_compute(backend, gf);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 }
 
 void bench_matmul_comparison(ggml_backend_t backend, int64_t dim, ggml_type quant_type) {
@@ -309,14 +334,114 @@ void bench_matmul_comparison(ggml_backend_t backend, int64_t dim, ggml_type quan
     ggml_free(ctx);
 }
 
+// Time 10 matmuls of the given dimensions with a fresh random A and B each
+// iteration, comparing ggml_mul_mat (std) against ggml_mul_mat_tiled.
+// Fresh inputs per iteration avoid favorable cache states from reusing the
+// same matrices; the start order is alternated to avoid warm-up bias.
+void bench_tiled_vs_std(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
+    const int num_iterations = 10;
+
+    struct ggml_init_params ip = { .mem_size = 512*1024*1024, .no_alloc = true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+
+    struct ggml_cgraph * gf_std  = ggml_new_graph(ctx);
+    struct ggml_tensor * C_std   = ggml_mul_mat(ctx, Bq, A);
+    ggml_build_forward_expand(gf_std, C_std);
+
+    struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
+    struct ggml_tensor * C_tiled  = ggml_mul_mat_tiled(ctx, Bq, A);
+    ggml_build_forward_expand(gf_tiled, C_tiled);
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    double time_std = 0.0, time_tiled = 0.0;
+
+    for (int i = 0; i < num_iterations; ++i) {
+        // fresh random data every iteration
+        float * A_data = gen_rand_f32(M * N);
+        float * B_data = gen_rand_f32(N * K);
+
+        // Bq is K rows of N in ggml layout, so transpose B into it
+        float * B_T = (float *) malloc(N * K * sizeof(float));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) {
+                B_T[k * N + n] = B_data[n * K + k];
+            }
+        }
+        fill_tensor(A,  A_data, M, N, GGML_TYPE_F32);
+        fill_tensor(Bq, B_T, K, N, quant_type);
+        free(A_data); free(B_data); free(B_T);
+
+        if (i % 2 == 0) {
+            time_std   += time_graph_compute(backend, gf_std);
+            time_tiled += time_graph_compute(backend, gf_tiled);
+        } else {
+            time_tiled += time_graph_compute(backend, gf_tiled);
+            time_std   += time_graph_compute(backend, gf_std);
+        }
+    }
+
+    const double tflops_std   = (2.0 * M * N * K * num_iterations) / (time_std   * 1e12);
+    const double tflops_tiled = (2.0 * M * N * K * num_iterations) / (time_tiled * 1e12);
+
+    printf("BENCH %lldx%lld * %lldx%lld (%s), %d iters: std %.4f s (%.3f TFLOPS), tiled %.4f s (%.3f TFLOPS), speedup %.2fx\n",
+           (long long)M, (long long)N, (long long)N, (long long)K,
+           ggml_type_name(quant_type), num_iterations,
+           time_std, tflops_std, time_tiled, tflops_tiled, time_std / time_tiled);
+
+    ggml_free(ctx);
+}
+
 int main(void) {
     ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(backend, 16);
     test_matmul(backend, 512, 1024, 512, GGML_TYPE_Q6_K);
+    test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q6_K);
+    test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q6_K);
+    test_matmul(backend, 357, 1024, 137, GGML_TYPE_Q6_K);
+    test_matmul(backend, 16, 1024, 16, GGML_TYPE_Q5_K);
     test_matmul(backend, 18, 1024, 7, GGML_TYPE_Q5_K);
+    test_matmul(backend, 18, 1024, 256, GGML_TYPE_Q5_K);
+    test_matmul(backend, 256, 1024, 7, GGML_TYPE_Q5_K);
+    test_matmul(backend, 16, 1024, 16, GGML_TYPE_Q5_K);
 
-    bench_matmul_comparison(backend, 8192, GGML_TYPE_F32);
-    bench_matmul_comparison(backend, 8192, GGML_TYPE_Q8_0);
-    bench_matmul_comparison(backend, 8192, GGML_TYPE_Q4_K);
+    // probes: N=256 (single QK_K block) vs N=512 (two blocks), per type
+    test_matmul(backend, 8, 256, 8, GGML_TYPE_Q5_K);
+    test_matmul(backend, 8, 512, 8, GGML_TYPE_Q5_K);
+    test_matmul(backend, 8, 256, 8, GGML_TYPE_Q6_K);
+    test_matmul(backend, 8, 512, 8, GGML_TYPE_Q6_K);
+
+    // fuzz: small M/K around tile (256) and microtile (16) boundaries
+    test_matmul(backend, 1, 1024, 1, GGML_TYPE_Q5_K);
+    test_matmul(backend, 2, 1024, 3, GGML_TYPE_Q5_K);
+    test_matmul(backend, 15, 1024, 15, GGML_TYPE_Q5_K);
+    test_matmul(backend, 17, 1024, 17, GGML_TYPE_Q5_K);
+    test_matmul(backend, 31, 1024, 31, GGML_TYPE_Q5_K);
+    test_matmul(backend, 33, 1024, 33, GGML_TYPE_Q5_K);
+    test_matmul(backend, 47, 1024, 47, GGML_TYPE_Q5_K);
+    test_matmul(backend, 255, 1024, 255, GGML_TYPE_Q5_K);
+    test_matmul(backend, 257, 1024, 257, GGML_TYPE_Q5_K);
+    test_matmul(backend, 271, 1024, 271, GGML_TYPE_Q5_K);
+    test_matmul(backend, 272, 1024, 272, GGML_TYPE_Q5_K);
+    test_matmul(backend, 511, 1024, 511, GGML_TYPE_Q5_K);
+    test_matmul(backend, 513, 1024, 513, GGML_TYPE_Q5_K);
+    test_matmul(backend, 33, 1024, 257, GGML_TYPE_Q5_K);
+    test_matmul(backend, 257, 1024, 33, GGML_TYPE_Q5_K);
+    test_matmul(backend, 17, 512, 17, GGML_TYPE_Q5_K);
+    test_matmul(backend, 17, 512, 257, GGML_TYPE_Q5_K);
+    test_matmul(backend, 257, 512, 17, GGML_TYPE_Q5_K);
+
+    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q6_K);
+    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q5_K);
+    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q4_K);
+
+    bench_tiled_vs_std(backend, 2048, 2048, 2048, GGML_TYPE_Q5_K);
+    bench_tiled_vs_std(backend, 8192, 1024, 8192, GGML_TYPE_Q6_K);
+    bench_tiled_vs_std(backend, 8192, 8192, 8192, GGML_TYPE_Q4_K);
+
     ggml_backend_free(backend);
     return 0;
 }
