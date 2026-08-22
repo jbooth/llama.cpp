@@ -816,6 +816,12 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
         return false;
     }
+    // small M (decode): the weight tile unpack is paid once per op and only amortized
+    // over M rows; below this the stock vec_dot/GEMV path wins (no row is processed
+    // twice, so there is no reuse to offset the unpack)
+    if (src1->ne[1] < 64) {
+        return false;
+    }
     return true;
 }
 

@@ -395,6 +395,140 @@ void bench_tiled_vs_std(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
     ggml_free(ctx);
 }
 
+// Fetch the CPU_REPACK extra buffer type through the public proc-address API,
+// the same way the model loader does. Returns NULL if repack is not built in.
+static ggml_backend_buffer_type_t get_cpu_repack_buft(void) {
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return NULL;
+    }
+    ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    ggml_backend_dev_get_extra_bufts_t get_extra =
+        (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+    if (!get_extra) {
+        return NULL;
+    }
+    ggml_backend_buffer_type_t * bufts = get_extra(cpu_dev);
+    // the only extra buffer type the CPU backend exposes is CPU_REPACK
+    return (bufts && *bufts) ? *bufts : NULL;
+}
+
+// Three-way benchmark: standard ggml_mul_mat, repacked ggml_mul_mat, and the
+// custom tiled kernel. std and tiled share a Q4_K weight tensor in the default
+// CPU buffer; repack uses a second Q4_K tensor allocated in the CPU_REPACK
+// buffer (whose set_tensor repacks the raw quants, and whose compute kernel is
+// selected automatically because the weight lives in that buffer type).
+void bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
+    const int num_iterations = 10;
+
+    ggml_backend_buffer_type_t repack_buft = get_cpu_repack_buft();
+    if (!repack_buft) {
+        printf("BENCH %lldx%lld * %lldx%lld (%s): CPU_REPACK buffer type unavailable, skipping repack path\n",
+               (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type));
+        return;
+    }
+    // repack 8x8 layout requires K (ne1) and N (ne0) to be multiples of 8
+    if (K % 8 != 0 || N % 8 != 0) {
+        printf("BENCH %lldx%lld * %lldx%lld (%s): N/K not multiples of 8, skipping repack path\n",
+               (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type));
+        return;
+    }
+
+    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * A      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    struct ggml_tensor * Bq_std = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+    struct ggml_tensor * Bq_rep = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+
+    struct ggml_cgraph * gf_std   = ggml_new_graph(ctx);
+    struct ggml_tensor * C_std    = ggml_mul_mat(ctx, Bq_std, A);
+    ggml_build_forward_expand(gf_std, C_std);
+
+    struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
+    struct ggml_tensor * C_tiled  = ggml_mul_mat_tiled(ctx, Bq_std, A);
+    ggml_build_forward_expand(gf_tiled, C_tiled);
+
+    struct ggml_cgraph * gf_repack = ggml_new_graph(ctx);
+    struct ggml_tensor * C_repack  = ggml_mul_mat(ctx, Bq_rep, A);
+    ggml_build_forward_expand(gf_repack, C_repack);
+
+    // Put Bq_rep into the repack buffer before the bulk allocation so the
+    // allocator treats it as pre-allocated and leaves it out of the default buffer.
+    ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(Bq_rep));
+    Bq_rep->buffer = buf_rep;
+    Bq_rep->data   = ggml_backend_buffer_get_base(buf_rep);
+    ggml_backend_buffer_init_tensor(buf_rep, Bq_rep);
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    // Integrity check: repack uses the same quantized weights as std, so the two
+    // outputs should agree up to accumulation/activation-quantization noise.
+    {
+        float * A_data = gen_rand_f32(M * N);
+        float * B_data = gen_rand_f32(N * K);
+        float * B_T = (float *) malloc(N * K * sizeof(float));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) {
+                B_T[k * N + n] = B_data[n * K + k];
+            }
+        }
+        fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
+        fill_tensor(Bq_std, B_T,    K, N, quant_type);
+        // same raw quants; the repack buffer's set_tensor repacks them in-place
+        fill_tensor(Bq_rep, B_T,    K, N, quant_type);
+        free(A_data); free(B_data); free(B_T);
+
+        ggml_backend_graph_compute(backend, gf_std);
+        ggml_backend_graph_compute(backend, gf_repack);
+
+        float * out_std   = (float *) malloc(M * K * sizeof(float));
+        float * out_repack = (float *) malloc(M * K * sizeof(float));
+        ggml_backend_tensor_get(C_std,    out_std,    0, ggml_nbytes(C_std));
+        ggml_backend_tensor_get(C_repack, out_repack, 0, ggml_nbytes(C_repack));
+
+        float max_err, rms_err;
+        compare_f32(out_std, out_repack, M * K, &max_err, &rms_err);
+        printf("  Integrity (repack vs std): max_err %.6f, rms %.6f\n\n", max_err, rms_err);
+        free(out_std); free(out_repack);
+    }
+
+    double time_std = 0.0, time_tiled = 0.0, time_repack = 0.0;
+
+    for (int i = 0; i < num_iterations; ++i) {
+        // fresh random data every iteration, shared across all three paths
+        float * A_data = gen_rand_f32(M * N);
+        float * B_data = gen_rand_f32(N * K);
+        float * B_T = (float *) malloc(N * K * sizeof(float));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) {
+                B_T[k * N + n] = B_data[n * K + k];
+            }
+        }
+        fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
+        fill_tensor(Bq_std, B_T,    K, N, quant_type);
+        fill_tensor(Bq_rep, B_T,    K, N, quant_type);
+        free(A_data); free(B_data); free(B_T);
+
+        time_std    += time_graph_compute(backend, gf_std);
+        time_tiled  += time_graph_compute(backend, gf_tiled);
+        time_repack += time_graph_compute(backend, gf_repack);
+    }
+
+    const double flops = 2.0 * M * N * K * num_iterations;
+    const double tflops_std    = flops / (time_std    * 1e12);
+    const double tflops_tiled  = flops / (time_tiled  * 1e12);
+    const double tflops_repack = flops / (time_repack * 1e12);
+
+    printf("BENCH %lldx%lld * %lldx%lld (%s), %d iters:\n",
+           (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type), num_iterations);
+    printf("  standard:  %8.4f s  %7.3f TFLOPS\n", time_std,    tflops_std);
+    printf("  repack:    %8.4f s  %7.3f TFLOPS  (%.2fx vs std)\n", time_repack, tflops_repack, time_std / time_repack);
+    printf("  tiled:     %8.4f s  %7.3f TFLOPS  (%.2fx vs std)\n\n", time_tiled, tflops_tiled, time_std / time_tiled);
+
+    ggml_free(ctx);
+}
+
 int main(void) {
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, 16);
@@ -460,6 +594,16 @@ int main(void) {
     bench_tiled_vs_std(backend, 2048, 2048, 2048, GGML_TYPE_Q5_K);
     bench_tiled_vs_std(backend, 8192, 1024, 8192, GGML_TYPE_Q6_K);
     bench_tiled_vs_std(backend, 8192, 8192, 8192, GGML_TYPE_Q4_K);
+
+    // three-way: standard vs repacked vs tiled for Q4_K
+    bench_three_way(backend, 8192, 8192, 8192, GGML_TYPE_Q4_K);
+
+    // small M (decode-like): weight unpack cost dominates at small M
+    bench_tiled_vs_std(backend, 1, 8192, 8192, GGML_TYPE_Q4_K);
+    bench_tiled_vs_std(backend, 4, 8192, 8192, GGML_TYPE_Q4_K);
+    bench_tiled_vs_std(backend, 16, 8192, 8192, GGML_TYPE_Q4_K);
+    bench_tiled_vs_std(backend, 32, 8192, 8192, GGML_TYPE_Q4_K);
+    bench_tiled_vs_std(backend, 64, 8192, 8192, GGML_TYPE_Q4_K);
 
     ggml_backend_free(backend);
     return 0;
