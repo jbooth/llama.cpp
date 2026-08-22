@@ -2,7 +2,7 @@
 
 // Tiled matmul kernel: tile structs, unpackers, microtile kernel.
 // C++ for the per-format template config (SUBBLK, HAS_MIN, BIAS); C-style code otherwise.
-// Phase 1: q5_K weights x q8_K activations, scalar kernel.
+// Phase 1/2: q4_K and q5_K weights x q8_K activations (scalar + VNNI kernel).
 
 #include "ggml-quants.h"
 
@@ -38,20 +38,35 @@ struct tiled_tile_a {
 static_assert(sizeof(tiled_tile_a<16, true, 0>) + sizeof(tiled_tile_b) < 512 * 1024,
               "tiled tile memory budget exceeded");
 
-// phase 1 config: q5_K (32-wide subblocks, min, no bias)
+// q4_K and q5_K share the tile layout: 32-wide subblocks, min, no bias, 1-byte codes
+typedef tiled_tile_a<32, true, 0> tiled_tile_a_q4_K;
 typedef tiled_tile_a<32, true, 0> tiled_tile_a_q5_K;
+
+// format tags select the A unpacker in the templated driver (the tile type is the same)
+struct tiled_fmt_q4_K {};
+struct tiled_fmt_q5_K {};
 
 // unpack one (window, k-block) into a tile: n_rows <= TILED_TILE_ROWS rows,
 // row r at rows + r*row_stride (in blocks)
+void tiled_unpack_a_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_a_q4_K * tile);
 void tiled_unpack_a_q5_K(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_a_q5_K * tile);
 void tiled_unpack_b_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_b * tile);
+
+// tag-dispatched unpack: rows is the base of one (window, k-block), cast to the format's block type
+inline void tiled_unpack_a(tiled_fmt_q4_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_a_q4_K * tile) {
+    tiled_unpack_a_q4_K((const block_q4_K *) rows, row_stride, n_rows, tile);
+}
+inline void tiled_unpack_a(tiled_fmt_q5_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_a_q5_K * tile) {
+    tiled_unpack_a_q5_K((const block_q5_K *) rows, row_stride, n_rows, tile);
+}
 
 // Accumulate one (window, k-block) partial sum into a j-major float buffer
 // (row width buf_stride, j contiguous): buf[i*buf_stride + j] += partial, i < n_a, j < n_b.
 // No store to C here: the driver holds the buffer across the 256-K blocks and
 // transpose-stores it once, so each C element is written a single time.
-void tiled_run_window_q5_K(const tiled_tile_a_q5_K & a, const tiled_tile_b & b,
-                           int n_a, int n_b, float * buf, int buf_stride);
+template <typename T> // T = tiled_tile_a<...>
+void tiled_run_window(const T & a, const tiled_tile_b & b,
+                      int n_a, int n_b, float * buf, int buf_stride);
 
 // Transpose-store the j-major buffer to C: C[i][j] = c[i + j*ldc] (i contiguous),
 // n_a rows x n_b cols, buffer row width buf_stride. Written with = (the buffer holds

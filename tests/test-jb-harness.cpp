@@ -415,6 +415,25 @@ int main(void) {
     test_matmul(backend, 8, 512, 8, GGML_TYPE_Q6_K);
 
     // fuzz: small M/K around tile (256) and microtile (16) boundaries
+    test_matmul(backend, 1, 1024, 1, GGML_TYPE_Q4_K);
+    test_matmul(backend, 2, 1024, 3, GGML_TYPE_Q4_K);
+    test_matmul(backend, 15, 1024, 15, GGML_TYPE_Q4_K);
+    test_matmul(backend, 17, 1024, 17, GGML_TYPE_Q4_K);
+    test_matmul(backend, 31, 1024, 31, GGML_TYPE_Q4_K);
+    test_matmul(backend, 33, 1024, 33, GGML_TYPE_Q4_K);
+    test_matmul(backend, 47, 1024, 47, GGML_TYPE_Q4_K);
+    test_matmul(backend, 255, 1024, 255, GGML_TYPE_Q4_K);
+    test_matmul(backend, 257, 1024, 257, GGML_TYPE_Q4_K);
+    test_matmul(backend, 271, 1024, 271, GGML_TYPE_Q4_K);
+    test_matmul(backend, 272, 1024, 272, GGML_TYPE_Q4_K);
+    test_matmul(backend, 511, 1024, 511, GGML_TYPE_Q4_K);
+    test_matmul(backend, 513, 1024, 513, GGML_TYPE_Q4_K);
+    test_matmul(backend, 33, 1024, 257, GGML_TYPE_Q4_K);
+    test_matmul(backend, 257, 1024, 33, GGML_TYPE_Q4_K);
+    test_matmul(backend, 17, 512, 17, GGML_TYPE_Q4_K);
+    test_matmul(backend, 17, 512, 257, GGML_TYPE_Q4_K);
+    test_matmul(backend, 257, 512, 17, GGML_TYPE_Q4_K);
+
     test_matmul(backend, 1, 1024, 1, GGML_TYPE_Q5_K);
     test_matmul(backend, 2, 1024, 3, GGML_TYPE_Q5_K);
     test_matmul(backend, 15, 1024, 15, GGML_TYPE_Q5_K);

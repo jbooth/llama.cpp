@@ -1,6 +1,6 @@
-// Tiled matmul kernel, phase 1: q5_K weights x q8_K activations, scalar.
-// The VNNI version of the microtile kernel lands in phase 2 behind
-// #if defined(__AVX512VNNI__) && defined(__AVX512VL__) in this file.
+// Tiled matmul kernel, phase 1/2: q4_K and q5_K weights x q8_K activations.
+// The kernel bodies are templated on the A tile config (identical for q4_K/q5_K).
+// AVX2 fallback for the microtile kernel is deferred.
 
 #include "tiled-kernel.h"
 #include "ggml-cpu-impl.h"
@@ -15,6 +15,40 @@
 #define TILED_KMASK1 0x3f3f3f3f
 #define TILED_KMASK2 0x0f0f0f0f
 #define TILED_KMASK3 0x03030303
+
+void tiled_unpack_a_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_a_q4_K * tile) {
+    for (int r = 0; r < n_rows; r++) {
+        const block_q4_K & xb = rows[r * row_stride];
+
+        tile->d[r]    = ggml_fp16_to_fp32(xb.d);
+        tile->dmin[r] = ggml_fp16_to_fp32(xb.dmin);
+
+        uint32_t utmp[4];
+        memcpy(utmp, xb.scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & TILED_KMASK2) | (((utmp[1] >> 6) & TILED_KMASK3) << 4);
+        const uint32_t uaux = utmp[1] & TILED_KMASK1;
+        utmp[1] = (utmp[2] & TILED_KMASK2) | (((utmp[0] >> 6) & TILED_KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= TILED_KMASK1;
+
+        const uint8_t * sc = (const uint8_t *) &utmp[0];
+        const uint8_t * mn = (const uint8_t *) &utmp[2];
+        for (int s = 0; s < 8; s++) {
+            tile->sc[r * 8 + s] = (int8_t) sc[s];
+            tile->mn[r * 8 + s] = (int8_t) mn[s];
+        }
+
+        // extract the 4-bit codes (low 4 + high 4), same extraction as the reference kernels
+        uint8_t * q = &tile->q[r * TILED_TILE_K];
+        for (int j = 0; j < 4; j++) {
+            const uint8_t * qs = xb.qs + 32 * j;
+            for (int l = 0; l < 32; l++) {
+                q[64 * j + l]       = qs[l] & 0xF;
+                q[64 * j + 32 + l]  = qs[l] >> 4;
+            }
+        }
+    }
+}
 
 void tiled_unpack_a_q5_K(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_a_q5_K * tile) {
     for (int r = 0; r < n_rows; r++) {
@@ -80,9 +114,12 @@ void tiled_unpack_b_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows
     }
 }
 
-static void tiled_run_window_q5_K_scalar(const tiled_tile_a_q5_K & a, const tiled_tile_b & b,
-                           int n_a, int n_b, float * buf, int buf_stride) {
-    const int NB = tiled_tile_a_q5_K::NB; // 8 subblocks of 32 per 256-K block
+template <typename T>
+static void tiled_run_window_scalar(const T & a, const tiled_tile_b & b,
+                                    int n_a, int n_b, float * buf, int buf_stride) {
+    constexpr int NB = T::NB;    // subblocks per 256-K block
+    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NS = SUBBLK / 16; // per-16 bsums per subblock
 
     for (int i0 = 0; i0 < n_a; i0 += TILED_MICRO) {
         const int n_i = n_a - i0 < TILED_MICRO ? n_a - i0 : TILED_MICRO;
@@ -94,17 +131,19 @@ static void tiled_run_window_q5_K_scalar(const tiled_tile_a_q5_K & a, const tile
             for (int s = 0; s < NB; s++) {
                 for (int j = 0; j < TILED_MICRO; j++) {
                     const int br = j0 + j;
-                    const int8_t * qb = &b.q[br * TILED_TILE_K + s * 32];
-                    const int32_t bs = (int32_t) b.bsums[br * 16 + 2 * s]
-                                     + (int32_t) b.bsums[br * 16 + 2 * s + 1];
+                    const int8_t * qb = &b.q[br * TILED_TILE_K + s * SUBBLK];
+                    int32_t bs = 0;
+                    for (int u = 0; u < NS; u++) {
+                        bs += b.bsums[br * 16 + s * NS + u];
+                    }
                     const float dB = b.d[br];
 
                     for (int i = 0; i < n_i; i++) {
                         const int ar = i0 + i;
-                        const uint8_t * qa = &a.q[ar * TILED_TILE_K + s * 32];
+                        const uint8_t * qa = &a.q[ar * TILED_TILE_K + s * SUBBLK];
 
                         int32_t raw = 0;
-                        for (int e = 0; e < 32; e++) {
+                        for (int e = 0; e < SUBBLK; e++) {
                             raw += (int32_t) qa[e] * (int32_t) qb[e];
                         }
 
@@ -143,9 +182,12 @@ static void tiled_run_window_q5_K_scalar(const tiled_tile_a_q5_K & a, const tile
 #define TILED_VNNI_A 8
 #define TILED_VNNI_B 16
 
-static void tiled_run_window_q5_K_vnni(const tiled_tile_a_q5_K & a, const tiled_tile_b & b,
-                                       int n_a, int n_b, float * buf, int buf_stride) {
-    const int NB = tiled_tile_a_q5_K::NB; // 8 subblocks of 32 per 256-K block
+template <typename T>
+static void tiled_run_window_vnni(const T & a, const tiled_tile_b & b,
+                                  int n_a, int n_b, float * buf, int buf_stride) {
+    constexpr int NB = T::NB;    // subblocks per 256-K block
+    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NS = SUBBLK / 16; // per-16 bsums per subblock
 
     for (int i0 = 0; i0 < n_a; i0 += TILED_VNNI_A) {
         for (int j0 = 0; j0 < n_b; j0 += TILED_VNNI_B) {
@@ -164,8 +206,10 @@ static void tiled_run_window_q5_K_vnni(const tiled_tile_a_q5_K & a, const tiled_
                 float bsdb[TILED_VNNI_B];
                 for (int jj = 0; jj < TILED_VNNI_B; jj++) {
                     const int br = j0 + jj;
-                    const int32_t bs = (int32_t) b.bsums[br * 16 + 2 * s]
-                                     + (int32_t) b.bsums[br * 16 + 2 * s + 1];
+                    int32_t bs = 0;
+                    for (int u = 0; u < NS; u++) {
+                        bs += b.bsums[br * 16 + s * NS + u];
+                    }
                     bsdb[jj] = (float) bs * b.d[br];
                 }
                 const __m512 bs_dB_vec = _mm512_loadu_ps(bsdb);
@@ -210,14 +254,19 @@ static void tiled_run_window_q5_K_vnni(const tiled_tile_a_q5_K & a, const tiled_
 
 #endif // __AVX512VNNI__ && __AVX512VL__
 
-void tiled_run_window_q5_K(const tiled_tile_a_q5_K & a, const tiled_tile_b & b,
-                           int n_a, int n_b, float * buf, int buf_stride) {
+template <typename T>
+void tiled_run_window(const T & a, const tiled_tile_b & b,
+                      int n_a, int n_b, float * buf, int buf_stride) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    tiled_run_window_q5_K_vnni(a, b, n_a, n_b, buf, buf_stride);
+    tiled_run_window_vnni(a, b, n_a, n_b, buf, buf_stride);
 #else
-    tiled_run_window_q5_K_scalar(a, b, n_a, n_b, buf, buf_stride);
+    tiled_run_window_scalar(a, b, n_a, n_b, buf, buf_stride);
 #endif
 }
+
+// explicit instantiations for the in-use tile types (q4_K and q5_K share the layout)
+template void tiled_run_window<tiled_tile_a_q4_K>(const tiled_tile_a_q4_K & a, const tiled_tile_b & b,
+                                                  int n_a, int n_b, float * buf, int buf_stride);
 
 // Transpose-store the j-major buffer to C (i contiguous). The buffer's natural layout
 // matches the VNNI microtile output (j-major), so per-block accumulation is a cheap

@@ -768,10 +768,10 @@ UseGgmlGemm2:;
     }
 }
 
-// === new tiled path (phase 1: q5_K, scalar kernel) ===
+// === new tiled path (q4_K / q5_K, scalar + VNNI kernel) ===
 
 struct TiledKernelWs {
-    tiled_tile_a_q5_K * a = nullptr;
+    tiled_tile_a_q5_K * a = nullptr; // q4_K and q5_K share the tile type
     tiled_tile_b      * b = nullptr;
     float             * acc = nullptr;
 
@@ -788,8 +788,8 @@ thread_local TiledKernelWs tiled_ws;
 static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
                                         const struct ggml_tensor * src1,
                                         const struct ggml_tensor * dst) {
-    // phase 1: q5_K weights only
-    if (src0->type != GGML_TYPE_Q5_K) {
+    // q4_K and q5_K weights only (the gateway switch grows per phase)
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
@@ -819,6 +819,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     return true;
 }
 
+template <typename Fmt>
 static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -896,7 +897,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
             const int64_t tile_ir0_end = MIN(tile_ir0 + 256, ir0_end);
             const int n_a = (int) (tile_ir0_end - tile_ir0);
 
-            const block_q5_K * a_rows = (const block_q5_K *) (a_base + tile_ir0 * nb01);
+            const char * a_rows = a_base + tile_ir0 * nb01;
 
             float * c = (float *) (c_base + tile_ir0 * nb0 + tile_ir1 * nb1);
 
@@ -905,9 +906,9 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
             // so every C element is written exactly once
             memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
             for (int b = 0; b < n_blocks; b++) {
-                tiled_unpack_a_q5_K(a_rows + b, a_stride, n_a, tiled_ws.a);
+                tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, tiled_ws.a);
                 tiled_unpack_b_q8_K(b_rows + b, b_stride, n_b, tiled_ws.b);
-                tiled_run_window_q5_K(*tiled_ws.a, *tiled_ws.b, n_a, n_b, tiled_ws.acc, TILED_TILE_ROWS);
+                tiled_run_window(*tiled_ws.a, *tiled_ws.b, n_a, n_b, tiled_ws.acc, TILED_TILE_ROWS);
             }
             tiled_store_window(tiled_ws.acc, n_a, n_b, TILED_TILE_ROWS, c, ldc);
         }
@@ -915,6 +916,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     }
 }
 
+template <typename Fmt>
 static void ggml_compute_forward_mul_mat_tiled_new(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1040,7 +1042,7 @@ static void ggml_compute_forward_mul_mat_tiled_new(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk_tiled_new(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk_tiled_new<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -1053,8 +1055,11 @@ static void ggml_compute_forward_mul_mat_tiled_new(
 static void tiled_matmul_gateway(const struct ggml_compute_params * params,
                                  struct ggml_tensor * dst) {
     switch (dst->src[0]->type) {
+        case GGML_TYPE_Q4_K:
+            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q4_K>(params, dst);
+            break;
         case GGML_TYPE_Q5_K:
-            ggml_compute_forward_mul_mat_tiled_new(params, dst);
+            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q5_K>(params, dst);
             break;
         default:
             break;
