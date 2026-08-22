@@ -229,7 +229,6 @@ static void tiled_run_window_scalar(const T & a, const tiled_tile_b & b,
                     for (int u = 0; u < NS; u++) {
                         bs += b.bsums[(s * NS + u) * TILED_TILE_ROWS + br];
                     }
-                    const float dB = b.d[br];
 
                     for (int i = 0; i < n_i; i++) {
                         const int ar = i0 + i;
@@ -246,22 +245,26 @@ static void tiled_run_window_scalar(const T & a, const tiled_tile_b & b,
                         if constexpr (BIAS != 0)
                             corr -= BIAS * bs;
                         const int32_t sc_raw = (int32_t) a.sc[ar * NB + s] * corr;
+                        // dB is NOT applied here: it is constant over the s-loop, so
+                        // acc holds the dB-un-scaled sum and the store below applies
+                        // dB once per element (same factoring as the VNNI kernel)
                         if constexpr (HAS_MIN) {
                             const int32_t mn_bs = (int32_t) a.mn[ar * NB + s] * bs;
-                            acc[i][j] += dB * ((float) a.d[ar] * (float) sc_raw
-                                             - (float) a.dmin[ar] * (float) mn_bs);
+                            acc[i][j] += (float) a.d[ar] * (float) sc_raw
+                                      - (float) a.dmin[ar] * (float) mn_bs;
                         } else {
-                            acc[i][j] += dB * (float) a.d[ar] * (float) sc_raw;
+                            acc[i][j] += (float) a.d[ar] * (float) sc_raw;
                         }
                     }
                 }
             }
 
             // accumulate the microtile into the j-major buffer (unconditional 16x16; the
-            // ragged rows/cols past n_i/n_j hold the microtile's zero padding)
+            // ragged rows/cols past n_i/n_j hold the microtile's zero padding); apply the
+            // column's dB here (hoisted out of the s-loop)
             for (int i = 0; i < TILED_MICRO; i++) {
                 for (int j = 0; j < TILED_MICRO; j++) {
-                    buf[(i0 + i) * buf_stride + (j0 + j)] += acc[i][j];
+                    buf[(i0 + i) * buf_stride + (j0 + j)] += b.d[j0 + j] * acc[i][j];
                 }
             }
         }
@@ -340,6 +343,7 @@ static void tiled_run_window_scalar(const T & a, const tiled_tile_b & b,
 // analyzed and rejected for exactly the register-count reason above.
 #define TILED_VNNI_A 8
 #define TILED_VNNI_B 16
+#define TILED_VNNI_INT_A 4 // int split-pass row band for HAS_MIN (avoids 24-zmm spills)
 
 template <typename T>
 static void tiled_run_window_vnni(const T & a, const tiled_tile_b & b,
@@ -379,12 +383,15 @@ static void tiled_run_window_vnni(const T & a, const tiled_tile_b & b,
             // accf[t]: the float accumulators. _mm512_setzero_ps builds
             // a 512-bit register with all 16 float lanes zero.
             // After this: accf[t] all lanes 0.
-            // Meaning going forward: accf[t] lane j = partial C[i0+t]
-            // [j0+j] over the subblocks seen so far in this 256-K block.
+            // Meaning going forward: accf[t] lane j = dB-un-scaled
+            // partial C[i0+t][j0+j] over the subblocks seen so far in
+            // this 256-K block (dB is applied once per row at the store
+            // below, since it is constant over the s-loop).
             // Held across the whole block; written into buf exactly once
             // per microtile, at the very end.
             __m512 accf[TILED_VNNI_A];
             for (int t = 0; t < TILED_VNNI_A; t++) accf[t] = _mm512_setzero_ps();
+
 
             for (int s = 0; s < NB; s++) {
                 // --- build bs_dB_vec: the B-side min-correction term, pre-scaled ---
@@ -423,13 +430,23 @@ static void tiled_run_window_vnni(const T & a, const tiled_tile_b & b,
                 }
                 // _mm512_cvtepi32_ps converts 16 int32 lanes to 16
                 // float32 lanes (exact here: values are integers below
-                // 2^24). _mm512_mul_ps multiplies 16 float lane-pairs,
-                // each with its own rounding.
-                // After this: bs_dB_vec lane j = bs[j0+j] * dB[j0+j],
-                // the whole B-side correction factor pre-scaled by the
-                // activation scale, so the per-row correction below is a
-                // single fused op.
-                const __m512 bs_dB_vec = _mm512_mul_ps(_mm512_cvtepi32_ps(bs32), dB_vec);
+                // 2^24).
+                // After this: bs_f lane j = bs[j0+j] as float, the B-side
+                // code sum for the min correction. dB is NOT folded in
+                // here: dB[j] is constant across the whole s-loop, so it
+                // is applied once per row when accf is written to buf at
+                // the end (one 16-wide mul per row instead of one per
+                // (row, subblock); exact up to the f32 reassociation).
+                const __m512 bs_f = _mm512_cvtepi32_ps(bs32);
+
+                // BIAS term BIAS*bs32 depends on (s, j-tile) but not on the
+                // A row (bs32 is B's per-column subblock sum), so compute it
+                // once per subblock instead of once per row. bs32 and BIAS are
+                // small, so the int32 product is exact. BIAS==0 compiles this
+                // out (bias32 stays zero, the per-row subtract below vanishes).
+                __m512i bias32 = _mm512_setzero_si512();
+                if constexpr (BIAS != 0)
+                    bias32 = _mm512_mullo_epi32(bs32, _mm512_set1_epi32(BIAS));
 
                 // acc16[t]: the int accumulators, one per A-row of the
                 // band. _mm512_setzero_si512 is the integer-spelling of
@@ -496,63 +513,157 @@ static void tiled_run_window_vnni(const T & a, const tiled_tile_b & b,
                 // complete and exact (all NG groups of 4 k-elements = the
                 // full SUBBLK). The algebra says this subblock adds
                 //     dB[j] * ( dA[t]*sc[t][s]*(raw - BIAS*bs[j]) - dmin[t]*mn[t][s]*bs[j] )
-                // to C[i0+t][j0+j]. The BIAS term (q3_K=4, q6_K=32; 0
+                // to C[i0+t][j0+j]. dB[j] is constant over the s-loop, so
+                // accf accumulates the dB-un-scaled inner factor and dB is
+                // applied once per row when accf goes to buf (see the
+                // store below). The BIAS term (q3_K=4, q6_K=32; 0
                 // otherwise) is subtracted from the exact int raw below; the
                 // dmin*mn term exists only for HAS_MIN (q4/q5/q2_K). Every
                 // factor is small enough that the whole thing is exact in
                 // f32 (products < 2^24). All 16 columns are converted and
                 // scaled in one pass per row:
+
                 for (int t = 0; t < TILED_VNNI_A; t++) {
                     const int ar = i0 + t;
                     // BIAS correction, exact in int32 (see plan section 4):
                     // sum(c*qB) with c = u - BIAS = sum(u*qB) - BIAS*sum(qB).
-                    // bs32 is B's per-subblock code sum (per column); BIAS is a
-                    // tiny scalar, so BIAS*bs32 is exact and fits int32. For the
+                    // bias32 = BIAS * bs32 is precomputed once per subblock
+                    // (it is per-column, shared by all 8 A-rows). For the
                     // BIAS==0 formats this whole if constexpr vanishes.
                     __m512i rawi = acc16[t];
                     if constexpr (BIAS != 0)
-                        rawi = _mm512_sub_epi32(rawi, _mm512_mullo_epi32(bs32, _mm512_set1_epi32(BIAS)));
-                    // _mm512_cvtepi32_ps again (see the bs_dB_vec build):
+                        rawi = _mm512_sub_epi32(rawi, bias32);
+                    // _mm512_cvtepi32_ps (see the bs_f build):
                     // 16 int32 -> 16 float32, exact in range.
                     // After this: f16 lane j = (raw - BIAS*bs)(t, j0+j, s) as float.
                     const __m512 f16 = _mm512_cvtepi32_ps(rawi);
-                    // _mm512_set1_ps is the float-spelling of set1:
-                    // broadcast one float32 scalar into all 16 lanes. The
-                    // scalar a.d[ar]*sc[ar*NB+s] = dA[t]*sc[t][s] is the
-                    // per-(row, subblock) weight scale (q3_K: sc already = raw-32).
-                    // After this: r lane j = dA[t]*sc[t][s]*(raw - BIAS*bs).
-                    const __m512 r = _mm512_mul_ps(f16, _mm512_set1_ps(a.d[ar] * (float) a.sc[ar * NB + s]));
-                    // _mm512_mul_ps again: scale on the activation side.
-                    // After this: out lane j = dA[t]*sc[t][s]*(raw - BIAS*bs)*dB[j].
-                    __m512 out = _mm512_mul_ps(r, dB_vec);
+                    // fused scale-and-accumulate: one FMA per (row, subblock)
+                    // instead of a mul + add (dB NOT yet applied -- see the
+                    // store below). q3_K: sc already = raw-32.
+                    accf[t] = _mm512_fmadd_ps(f16, _mm512_set1_ps(a.d[ar] * (float) a.sc[ar * NB + s]), accf[t]);
                     // min term, HAS_MIN formats only (q4/q5/q2_K): subtract
-                    // dmin[t]*mn[t][s]*bs[j]*dB[j]. _mm512_fnmadd_ps(A, B, C)
-                    // computes B*C - A with ONE rounding (negative FMA).
+                    // dmin[t]*mn[t][s]*bs[j] with one negative FMA.
                     if constexpr (HAS_MIN)
-                        out = _mm512_fnmadd_ps(_mm512_set1_ps(a.dmin[ar] * (float) a.mn[ar * NB + s]), bs_dB_vec, out);
-                    // _mm512_add_ps: plain lane-wise float add (the
-                    // non-fused sibling of fnmadd).
-                    // After this: accf[t] lane j = partial C[i0+t][j0+j]
-                    // over subblocks 0..s of this 256-K block.
-                    accf[t] = _mm512_add_ps(accf[t], out);
+                        accf[t] = _mm512_fnmadd_ps(_mm512_set1_ps(a.dmin[ar] * (float) a.mn[ar * NB + s]), bs_f, accf[t]);
                 }
             }
             // --- write the microtile into the j-major buffer ---
             //
             // After the s-loop: accf[t] lane j holds the complete
-            // 256-K-block partial sum for C[i0+t][j0+j] (all NB
-            // subblocks). buf accumulates across k-blocks, so each of
-            // the 8 rows is a read-add-store. _mm512_loadu_ps (16
-            // floats, as for dB_vec) + _mm512_add_ps (as above) +
-            // _mm512_storeu_ps, which stores 16 float32 (64 bytes) to
-            // unaligned memory. The buffer row for this j-tile is 16
-            // CONTIGUOUS floats (j-major layout), so each row is one
-            // 64B-aligned add: no striding, no write amplification.
-            // (Rows past n_a add harmless garbage that the driver's
-            // store to C never reads.)
+            // dB-un-scaled 256-K-block partial sum for C[i0+t][j0+j]
+            // (all NB subblocks). Apply dB here (once per row, not once
+            // per (row, subblock): it is constant over the s-loop), then
+            // add into buf. buf accumulates across k-blocks, so each of
+            // the 8 rows is a read-mul-add-store. _mm512_loadu_ps (16
+            // floats, as for dB_vec) + _mm512_mul_ps + _mm512_add_ps
+            // (as above) + _mm512_storeu_ps, which stores 16 float32
+            // (64 bytes) to unaligned memory. The buffer row for this
+            // j-tile is 16 CONTIGUOUS floats (j-major layout), so each
+            // row is one 64B-aligned RMW: no striding, no write
+            // amplification. (Rows past n_a add harmless garbage that
+            // the driver's store to C never reads.)
             for (int t = 0; t < TILED_VNNI_A; t++) {
                 float * p = &buf[(i0 + t) * buf_stride + j0];
-                _mm512_storeu_ps(p, _mm512_add_ps(_mm512_loadu_ps(p), accf[t]));
+                _mm512_storeu_ps(p, _mm512_add_ps(_mm512_loadu_ps(p), _mm512_mul_ps(accf[t], dB_vec)));
+            }
+        }
+    }
+}
+
+// =====================================================================
+// VNNI microtile kernel, int split-pass variant
+// =====================================================================
+//
+// Same dpbusd loop as tiled_run_window_vnni, but the per-subblock
+// correction is done in int32 instead of float. sc and mn are int8
+// in the tile, so sc*raw and mn*bs are exact int32 products. The
+// per-row floats dA/dmin are applied once at the epilogue instead
+// of once per (row, subblock).
+//
+// This moves the correction from the FMA pipe (which also runs
+// dpbusd on Zen 5) to the INT pipe (3 ports, no contention with
+// dpbusd). Per-subblock cost drops from cvt+fmadd+fnmadd (3 FMA
+// pipe ops) to mullo+padd (2 INT pipe ops, or 4 with HAS_MIN).
+//
+// Register pressure (4-row bands): S1acc[4] + acc16[4] = 8 zmm (no-min),
+// S1acc[4] + S2acc[4] + acc16[4] = 12 zmm (HAS_MIN). Fits the 32-ZMM
+// file without spills (the 8-row variant needs 24 zmm and spills).
+//
+// Math (identical to the float kernel, different association):
+//   float: accf += dA*sc_s*raw_s - dmin*mn_s*bs_s  (per subblock)
+//   int:   S1 += sc_s*raw_s,  S2 += mn_s*bs_s       (per subblock)
+//          result = dA*S1 - dmin*S2                   (per row, end)
+
+ template <typename T>
+static void tiled_run_window_vnni_int(const T & a, const tiled_tile_b & b,
+                                      int n_a, int n_b, float * buf, int buf_stride) {
+    constexpr int NB = T::NB;
+    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NS = SUBBLK / 16;
+    constexpr int NG = SUBBLK / 4;
+    constexpr bool HAS_MIN = T::HAS_MIN_V;
+    constexpr int BIAS = T::BIAS_V;
+
+    constexpr int NA = HAS_MIN ? TILED_VNNI_INT_A : TILED_VNNI_A;
+
+    for (int i0 = 0; i0 < n_a; i0 += NA) {
+        for (int j0 = 0; j0 < n_b; j0 += TILED_VNNI_B) {
+            const __m512 dB_vec = _mm512_loadu_ps(&b.d[j0]);
+
+            __m512i S1acc[NA];
+            for (int t = 0; t < NA; t++) S1acc[t] = _mm512_setzero_si512();
+            __m512i S2acc[NA];
+            if constexpr (HAS_MIN)
+                for (int t = 0; t < NA; t++) S2acc[t] = _mm512_setzero_si512();
+
+            for (int s = 0; s < NB; s++) {
+                __m512i bs32 = _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &b.bsums[s * TILED_TILE_ROWS * NS + j0]));
+                for (int u = 1; u < NS; u++) {
+                    bs32 = _mm512_add_epi32(bs32, _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &b.bsums[(s * NS + u) * TILED_TILE_ROWS + j0])));
+                }
+
+                __m512i bias32 = _mm512_setzero_si512();
+                if constexpr (BIAS != 0)
+                    bias32 = _mm512_mullo_epi32(bs32, _mm512_set1_epi32(BIAS));
+
+                __m512i acc16[NA];
+                for (int t = 0; t < NA; t++) acc16[t] = _mm512_setzero_si512();
+
+                for (int g = 0; g < NG; g++) {
+                    const int kg = s * NG + g;
+                    const __m512i Bz = _mm512_loadu_si512((const __m512i *) &b.qv[kg * TILED_TILE_ROWS * 4 + j0 * 4]);
+                    for (int t = 0; t < NA; t++) {
+                        const uint32_t a4 = *(const uint32_t *) &a.q[(i0 + t) * TILED_TILE_K + kg * 4];
+                        const __m512i Ab = _mm512_set1_epi32((int) a4);
+                        acc16[t] = _mm512_dpbusd_epi32(acc16[t], Ab, Bz);
+                    }
+                }
+
+                // int correction: S1 += sc*(raw-BIAS*bs), S2 += mn*bs
+                for (int t = 0; t < NA; t++) {
+                    const int ar = i0 + t;
+                    __m512i rawi = acc16[t];
+                    if constexpr (BIAS != 0)
+                        rawi = _mm512_sub_epi32(rawi, bias32);
+                    S1acc[t] = _mm512_add_epi32(S1acc[t],
+                        _mm512_mullo_epi32(rawi, _mm512_set1_epi32((int) a.sc[ar * NB + s])));
+                    if constexpr (HAS_MIN)
+                        S2acc[t] = _mm512_add_epi32(S2acc[t],
+                            _mm512_mullo_epi32(bs32, _mm512_set1_epi32((int) a.mn[ar * NB + s])));
+                }
+            }
+
+            // epilogue: int->float, apply per-row scales, store to buf
+            for (int t = 0; t < NA; t++) {
+                const int ar = i0 + t;
+                __m512 f1 = _mm512_cvtepi32_ps(S1acc[t]);
+                __m512 result = _mm512_mul_ps(f1, _mm512_set1_ps(a.d[ar]));
+                if constexpr (HAS_MIN) {
+                    __m512 f2 = _mm512_cvtepi32_ps(S2acc[t]);
+                    result = _mm512_fnmadd_ps(_mm512_set1_ps(a.dmin[ar]), f2, result);
+                }
+                float * p = &buf[(i0 + t) * buf_stride + j0];
+                _mm512_storeu_ps(p, _mm512_add_ps(_mm512_loadu_ps(p), _mm512_mul_ps(result, dB_vec)));
             }
         }
     }
@@ -564,7 +675,7 @@ template <typename T>
 void tiled_run_window(const T & a, const tiled_tile_b & b,
                       int n_a, int n_b, float * buf, int buf_stride) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-    tiled_run_window_vnni(a, b, n_a, n_b, buf, buf_stride);
+    tiled_run_window_vnni_int(a, b, n_a, n_b, buf, buf_stride);
 #else
     tiled_run_window_scalar(a, b, n_a, n_b, buf, buf_stride);
 #endif

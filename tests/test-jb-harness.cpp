@@ -24,7 +24,6 @@ static void compare_f32(const float * ref, const float * out, int64_t n, float *
     for (int64_t i = 0; i < n; ++i) {
         float err = fabsf(ref[i] - out[i]);
         if (err > *max_err) {
-            printf("New max err %f  ref %f out %f \n", *max_err, ref[i], out[i]);
             *max_err = err;
         }
         sum_sq_err += (double)err * err;
@@ -151,248 +150,12 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     //if (max_err > tol) { exit(1); }
 }
 
-void bench_matmul(ggml_backend_t backend, int64_t dim, ggml_type quant_type) {
-    int64_t M = dim, N = dim, K = dim;
-    int num_iterations = 10;
-
-    // 1. Prepare data
-    float * A_data = gen_rand_f32(M * N);
-    float ** B_datas = (float **) malloc(num_iterations * sizeof(float *));
-    for (int i = 0; i < num_iterations; ++i) {
-        B_datas[i] = gen_rand_f32(N * K);
-    }
-
-    // 2. GGML Setup
-    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
-    struct ggml_context * ctx = ggml_init(ip);
-
-    struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
-    struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
-    struct ggml_tensor * C  = ggml_mul_mat(ctx, Bq, A);
-
-    struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, C);
-
-    // Allocate on backend
-    ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-    // 3. Pre-upload A and pre-quantize all B matrices to save time
-    fill_tensor(A, A_data, M, N, GGML_TYPE_F32);
-
-    struct ggml_tensor ** B_tensors = (ggml_tensor**) malloc(num_iterations * sizeof(struct ggml_tensor *));
-    for (int i = 0; i < num_iterations; ++i) {
-        // We create temporary tensors just to hold the quantized data on the backend
-        B_tensors[i] = ggml_new_tensor_2d(ctx, quant_type, N, K);
-        ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-
-        // Transpose and Fill
-        float * B_ref_T = (float *) malloc(N * K * sizeof(float));
-        for (int n = 0; n < N; ++n) {
-            for (int k = 0; k < K; ++k) B_ref_T[k * N + n] = B_datas[i][n * K + k];
-        }
-        fill_tensor(B_tensors[i], B_ref_T, K, N, quant_type);
-        free(B_ref_T);
-    }
-
-    printf("Benchmarking %s: %lldx%lld matmul (%d iterations)...\n",
-           ggml_type_name(quant_type), (long long)dim, (long long)dim, num_iterations);
-
-    // 4. Execution Loop
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    for (int i = 0; i < num_iterations; ++i) {
-        // Point the graph's Bq to the pre-quantized buffer
-        // Note: In a real scenario, you'd usually swap data or use a weight-sharded approach
-        // Here we use ggml_backend_tensor_copy for a clean swap into the compute graph tensor
-        ggml_backend_tensor_copy(B_tensors[i], Bq);
-
-        ggml_backend_graph_compute(backend, gf);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    // 5. Calculate Results
-    double seconds = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    double tflops = (2.0 * M * N * K * num_iterations) / (seconds * 1e12);
-
-    printf("  Total time: %.4f s\n", seconds);
-    printf("  Avg time:   %.4f s/iter\n", seconds / num_iterations);
-    printf("  Throughput: %.4f TFLOPS\n\n", tflops);
-
-    // Cleanup
-    for (int i = 0; i < num_iterations; ++i) free(B_datas[i]);
-    free(B_datas); free(B_tensors); free(A_data);
-    ggml_free(ctx);
-}
-
 static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     ggml_backend_graph_compute(backend, gf);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-}
-
-void bench_matmul_comparison(ggml_backend_t backend, int64_t dim, ggml_type quant_type) {
-    int64_t M = dim, N = dim, K = dim;
-    int num_iterations = 10;
-
-    // 1. Prepare data
-    float * A_data = gen_rand_f32(M * N);
-    float ** B_datas = (float **) malloc(num_iterations * sizeof(float *));
-    for (int i = 0; i < num_iterations; ++i) {
-        B_datas[i] = gen_rand_f32(N * K);
-    }
-
-    struct ggml_init_params ip = { .mem_size = 512*1024*1024, .no_alloc = true };
-    struct ggml_context * ctx = ggml_init(ip);
-
-    struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
-    struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
-
-    // 2. Build Graphs
-    struct ggml_cgraph * gf_std = ggml_new_graph(ctx);
-    struct ggml_tensor * C_std  = ggml_mul_mat(ctx, Bq, A);
-    ggml_build_forward_expand(gf_std, C_std);
-
-    struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
-    struct ggml_tensor * C_tiled  = ggml_mul_mat_tiled(ctx, Bq, A);
-    ggml_build_forward_expand(gf_tiled, C_tiled);
-
-    ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-    // 3. Setup Tensors
-    fill_tensor(A, A_data, M, N, GGML_TYPE_F32);
-    struct ggml_tensor ** B_tensors = (ggml_tensor **) malloc(num_iterations * sizeof(struct ggml_tensor *));
-    for (int i = 0; i < num_iterations; ++i) {
-        B_tensors[i] = ggml_new_tensor_2d(ctx, quant_type, N, K);
-        ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-        float * B_ref_T = (float *) malloc(N * K * sizeof(float));
-        for (int n = 0; n < N; ++n) {
-            for (int k = 0; k < K; ++k) B_ref_T[k * N + n] = B_datas[i][n * K + k];
-        }
-        fill_tensor(B_tensors[i], B_ref_T, K, N, quant_type);
-        free(B_ref_T);
-    }
-
-    // --- INTEGRITY CHECK PHASE ---
-    printf("Validating Tiled Output Accuracy...\n");
-    ggml_backend_tensor_copy(B_tensors[0], Bq);
-    ggml_backend_graph_compute(backend, gf_std);
-    ggml_backend_graph_compute(backend, gf_tiled);
-
-    float * out_std   = (float *) malloc(M * K * sizeof(float));
-    float * out_tiled = (float *) malloc(M * K * sizeof(float));
-
-    // Get results from backend
-    ggml_backend_tensor_get(C_std,   out_std,   0, ggml_nbytes(C_std));
-    ggml_backend_tensor_get(C_tiled, out_tiled, 0, ggml_nbytes(C_tiled));
-
-    float max_err, rms_err;
-    compare_f32(out_std, out_tiled, M * K, &max_err, &rms_err);
-
-    // Standard GGML kernels and custom tiled kernels should be identical for F32,
-    // and extremely close (epsilon differences) for quantized types due to accumulation order.
-    bool pass = (max_err < 1e-4f);
-    printf("  Integrity: %s (Max Err: %f, RMS Err: %f)\n", pass ? "PASS" : "FAIL", max_err, rms_err);
-
-    if (!pass) {
-        printf("  WARNING: Tiled results deviate from standard implementation!\n");
-    }
-
-    // --- PERFORMANCE BENCHMARK PHASE ---
-    printf("Benchmarking %lldx%lld (%s)...\n", (long long)dim, (long long)dim, ggml_type_name(quant_type));
-
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < num_iterations; ++i) {
-        ggml_backend_tensor_copy(B_tensors[i], Bq);
-        ggml_backend_graph_compute(backend, gf_std);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double time_std = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < num_iterations; ++i) {
-        ggml_backend_tensor_copy(B_tensors[i], Bq);
-        ggml_backend_graph_compute(backend, gf_tiled);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double time_tiled = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-
-    printf("  Standard: %.4f s\n", time_std);
-    printf("  Tiled:    %.4f s\n", time_tiled);
-    printf("  Speedup:  %.2fx\n\n", time_std / time_tiled);
-
-    // Cleanup
-    free(out_std); free(out_tiled);
-    for (int i = 0; i < num_iterations; ++i) free(B_datas[i]);
-    free(B_datas); free(B_tensors); free(A_data);
-    ggml_free(ctx);
-}
-
-// Time 10 matmuls of the given dimensions with a fresh random A and B each
-// iteration, comparing ggml_mul_mat (std) against ggml_mul_mat_tiled.
-// Fresh inputs per iteration avoid favorable cache states from reusing the
-// same matrices; the start order is alternated to avoid warm-up bias.
-void bench_tiled_vs_std(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
-    const int num_iterations = 10;
-
-    struct ggml_init_params ip = { .mem_size = 512*1024*1024, .no_alloc = true };
-    struct ggml_context * ctx = ggml_init(ip);
-
-    struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
-    struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
-
-    struct ggml_cgraph * gf_std  = ggml_new_graph(ctx);
-    struct ggml_tensor * C_std   = ggml_mul_mat(ctx, Bq, A);
-    ggml_build_forward_expand(gf_std, C_std);
-
-    struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
-    struct ggml_tensor * C_tiled  = ggml_mul_mat_tiled(ctx, Bq, A);
-    ggml_build_forward_expand(gf_tiled, C_tiled);
-
-    ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-    double time_std = 0.0, time_tiled = 0.0;
-
-    for (int i = 0; i < num_iterations; ++i) {
-        // fresh random data every iteration
-        float * A_data = gen_rand_f32(M * N);
-        float * B_data = gen_rand_f32(N * K);
-
-        // Bq is K rows of N in ggml layout, so transpose B into it
-        float * B_T = (float *) malloc(N * K * sizeof(float));
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t k = 0; k < K; ++k) {
-                B_T[k * N + n] = B_data[n * K + k];
-            }
-        }
-        fill_tensor(A,  A_data, M, N, GGML_TYPE_F32);
-        fill_tensor(Bq, B_T, K, N, quant_type);
-        free(A_data); free(B_data); free(B_T);
-
-        if (i % 2 == 0) {
-            time_std   += time_graph_compute(backend, gf_std);
-            time_tiled += time_graph_compute(backend, gf_tiled);
-        } else {
-            time_tiled += time_graph_compute(backend, gf_tiled);
-            time_std   += time_graph_compute(backend, gf_std);
-        }
-    }
-
-    const double tflops_std   = (2.0 * M * N * K * num_iterations) / (time_std   * 1e12);
-    const double tflops_tiled = (2.0 * M * N * K * num_iterations) / (time_tiled * 1e12);
-
-    printf("BENCH %lldx%lld * %lldx%lld (%s), %d iters: std %.4f s (%.3f TFLOPS), tiled %.4f s (%.3f TFLOPS), speedup %.2fx\n",
-           (long long)M, (long long)N, (long long)N, (long long)K,
-           ggml_type_name(quant_type), num_iterations,
-           time_std, tflops_std, time_tiled, tflops_tiled, time_std / time_tiled);
-
-    ggml_free(ctx);
 }
 
 // Fetch the CPU_REPACK extra buffer type through the public proc-address API,
@@ -413,26 +176,28 @@ static ggml_backend_buffer_type_t get_cpu_repack_buft(void) {
     return (bufts && *bufts) ? *bufts : NULL;
 }
 
-// Three-way benchmark: standard ggml_mul_mat, repacked ggml_mul_mat, and the
-// custom tiled kernel. std and tiled share a Q4_K weight tensor in the default
-// CPU buffer; repack uses a second Q4_K tensor allocated in the CPU_REPACK
-// buffer (whose set_tensor repacks the raw quants, and whose compute kernel is
-// selected automatically because the weight lives in that buffer type).
-void bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
-    const int num_iterations = 10;
+struct bench_row {
+    const char * name;
+    double time_std, time_repack, time_tiled;
+    float max_err_repack, rmse_repack;
+    float max_err_tiled, rmse_tiled;
+    bool have_repack;
+};
 
-    ggml_backend_buffer_type_t repack_buft = get_cpu_repack_buft();
-    if (!repack_buft) {
-        printf("BENCH %lldx%lld * %lldx%lld (%s): CPU_REPACK buffer type unavailable, skipping repack path\n",
-               (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type));
-        return;
-    }
-    // repack 8x8 layout requires K (ne1) and N (ne0) to be multiples of 8
-    if (K % 8 != 0 || N % 8 != 0) {
-        printf("BENCH %lldx%lld * %lldx%lld (%s): N/K not multiples of 8, skipping repack path\n",
-               (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type));
-        return;
-    }
+// One timed run of each path (standard ggml_mul_mat, repacked ggml_mul_mat
+// via the CPU_REPACK buffer, ggml_mul_mat_tiled) on the same quantized
+// weights, plus max error and RMSE vs the standard output. std and tiled
+// share one weight tensor; repack uses a second tensor in the repack buffer
+// (whose set_tensor repacks the raw quants, and whose kernel is selected
+// because the weight lives in that buffer type). The repack column is only
+// available where a repack kernel exists for the type (x86: q4_K, q2_K);
+// init_tensor sets Bq_rep->extra to the repack layout or NULL.
+static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
+    bench_row row;
+    row.name = ggml_type_name(quant_type);
+    row.time_std = row.time_repack = row.time_tiled = 0.0;
+    row.max_err_repack = row.rmse_repack = row.max_err_tiled = row.rmse_tiled = 0.0f;
+    row.have_repack = false;
 
     struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
     struct ggml_context * ctx = ggml_init(ip);
@@ -455,78 +220,85 @@ void bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, gg
 
     // Put Bq_rep into the repack buffer before the bulk allocation so the
     // allocator treats it as pre-allocated and leaves it out of the default buffer.
-    ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(Bq_rep));
-    Bq_rep->buffer = buf_rep;
-    Bq_rep->data   = ggml_backend_buffer_get_base(buf_rep);
-    ggml_backend_buffer_init_tensor(buf_rep, Bq_rep);
+    // repack 8x8 layout requires N (ne0) and K (ne1) to be multiples of 8.
+    ggml_backend_buffer_type_t repack_buft = get_cpu_repack_buft();
+    if (repack_buft && N % 8 == 0 && K % 8 == 0) {
+        ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(Bq_rep));
+        Bq_rep->buffer = buf_rep;
+        Bq_rep->data   = ggml_backend_buffer_get_base(buf_rep);
+        ggml_backend_buffer_init_tensor(buf_rep, Bq_rep);
+        row.have_repack = (Bq_rep->extra != NULL);
+    }
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    // Integrity check: repack uses the same quantized weights as std, so the two
-    // outputs should agree up to accumulation/activation-quantization noise.
-    {
-        float * A_data = gen_rand_f32(M * N);
-        float * B_data = gen_rand_f32(N * K);
-        float * B_T = (float *) malloc(N * K * sizeof(float));
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t k = 0; k < K; ++k) {
-                B_T[k * N + n] = B_data[n * K + k];
-            }
+    float * A_data = gen_rand_f32(M * N);
+    float * B_data = gen_rand_f32(N * K);
+    // Bq is K rows of N in ggml layout, so transpose B into it
+    float * B_T = (float *) malloc(N * K * sizeof(float));
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            B_T[k * N + n] = B_data[n * K + k];
         }
-        fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
-        fill_tensor(Bq_std, B_T,    K, N, quant_type);
+    }
+    fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
+    fill_tensor(Bq_std, B_T,    K, N, quant_type);
+    if (row.have_repack) {
         // same raw quants; the repack buffer's set_tensor repacks them in-place
         fill_tensor(Bq_rep, B_T,    K, N, quant_type);
-        free(A_data); free(B_data); free(B_T);
+    }
+    free(A_data); free(B_data); free(B_T);
 
-        ggml_backend_graph_compute(backend, gf_std);
-        ggml_backend_graph_compute(backend, gf_repack);
+    // one timing per path
+    row.time_std    = time_graph_compute(backend, gf_std);
+    if (row.have_repack) {
+        row.time_repack = time_graph_compute(backend, gf_repack);
+    }
+    row.time_tiled  = time_graph_compute(backend, gf_tiled);
 
-        float * out_std   = (float *) malloc(M * K * sizeof(float));
-        float * out_repack = (float *) malloc(M * K * sizeof(float));
-        ggml_backend_tensor_get(C_std,    out_std,    0, ggml_nbytes(C_std));
+    // errors vs the standard output (all paths use the same quantized weights)
+    float * out_std    = (float *) malloc(M * K * sizeof(float));
+    float * out_tiled  = (float *) malloc(M * K * sizeof(float));
+    float * out_repack = (float *) malloc(M * K * sizeof(float));
+    ggml_backend_tensor_get(C_std,   out_std,   0, ggml_nbytes(C_std));
+    ggml_backend_tensor_get(C_tiled, out_tiled, 0, ggml_nbytes(C_tiled));
+    if (row.have_repack) {
         ggml_backend_tensor_get(C_repack, out_repack, 0, ggml_nbytes(C_repack));
-
-        float max_err, rms_err;
-        compare_f32(out_std, out_repack, M * K, &max_err, &rms_err);
-        printf("  Integrity (repack vs std): max_err %.6f, rms %.6f\n\n", max_err, rms_err);
-        free(out_std); free(out_repack);
+        compare_f32(out_std, out_repack, M * K, &row.max_err_repack, &row.rmse_repack);
     }
-
-    double time_std = 0.0, time_tiled = 0.0, time_repack = 0.0;
-
-    for (int i = 0; i < num_iterations; ++i) {
-        // fresh random data every iteration, shared across all three paths
-        float * A_data = gen_rand_f32(M * N);
-        float * B_data = gen_rand_f32(N * K);
-        float * B_T = (float *) malloc(N * K * sizeof(float));
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t k = 0; k < K; ++k) {
-                B_T[k * N + n] = B_data[n * K + k];
-            }
-        }
-        fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
-        fill_tensor(Bq_std, B_T,    K, N, quant_type);
-        fill_tensor(Bq_rep, B_T,    K, N, quant_type);
-        free(A_data); free(B_data); free(B_T);
-
-        time_std    += time_graph_compute(backend, gf_std);
-        time_tiled  += time_graph_compute(backend, gf_tiled);
-        time_repack += time_graph_compute(backend, gf_repack);
-    }
-
-    const double flops = 2.0 * M * N * K * num_iterations;
-    const double tflops_std    = flops / (time_std    * 1e12);
-    const double tflops_tiled  = flops / (time_tiled  * 1e12);
-    const double tflops_repack = flops / (time_repack * 1e12);
-
-    printf("BENCH %lldx%lld * %lldx%lld (%s), %d iters:\n",
-           (long long)M, (long long)N, (long long)N, (long long)K, ggml_type_name(quant_type), num_iterations);
-    printf("  standard:  %8.4f s  %7.3f TFLOPS\n", time_std,    tflops_std);
-    printf("  repack:    %8.4f s  %7.3f TFLOPS  (%.2fx vs std)\n", time_repack, tflops_repack, time_std / time_repack);
-    printf("  tiled:     %8.4f s  %7.3f TFLOPS  (%.2fx vs std)\n\n", time_tiled, tflops_tiled, time_std / time_tiled);
+    compare_f32(out_std, out_tiled, M * K, &row.max_err_tiled, &row.rmse_tiled);
+    free(out_std); free(out_tiled); free(out_repack);
 
     ggml_free(ctx);
+    return row;
+}
+
+static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row * rows, size_t n_types) {
+    const double flops = 2.0 * M * N * K;
+
+    printf("\nBENCH %lldx%lld * %lldx%lld, one timing per path, 16 threads\n",
+           (long long)M, (long long)N, (long long)N, (long long)K);
+    printf("%-8s %10s %12s %12s %11s %11s %15s %15s %15s %15s\n",
+           "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
+           "max_err(repack)", "rmse(repack)", "max_err(tiled)", "rmse(tiled)");
+    for (size_t i = 0; i < n_types; ++i) {
+        const bench_row * r = &rows[i];
+        if (r->have_repack) {
+            printf("%-8s %10.3f %12.3f %12.3f %11.2fx %11.2fx %15.6e %15.6e %15.6e %15.6e\n",
+                   r->name,
+                   flops / (r->time_std * 1e12),
+                   flops / (r->time_repack * 1e12), flops / (r->time_tiled * 1e12),
+                   r->time_std / r->time_repack, r->time_std / r->time_tiled,
+                   r->max_err_repack, r->rmse_repack, r->max_err_tiled, r->rmse_tiled);
+        } else {
+            printf("%-8s %10.3f %12s %12.3f %11s %11.2fx %15s %15s %15.6e %15.6e\n",
+                   r->name,
+                   flops / (r->time_std * 1e12),
+                   "n/a", flops / (r->time_tiled * 1e12), "n/a",
+                   r->time_std / r->time_tiled,
+                   "n/a", "n/a", r->max_err_tiled, r->rmse_tiled);
+        }
+    }
 }
 
 int main(void) {
@@ -604,23 +376,21 @@ int main(void) {
     test_matmul(backend, 17, 512, 257, GGML_TYPE_Q5_K);
     test_matmul(backend, 257, 512, 17, GGML_TYPE_Q5_K);
 
-    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q6_K);
-    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q5_K);
-    // bench_matmul_comparison(backend, 8192, GGML_TYPE_Q4_K);
-
-    bench_tiled_vs_std(backend, 2048, 2048, 2048, GGML_TYPE_Q5_K);
-    bench_tiled_vs_std(backend, 8192, 1024, 8192, GGML_TYPE_Q6_K);
-    bench_tiled_vs_std(backend, 8192, 8192, 8192, GGML_TYPE_Q4_K);
-
-    // three-way: standard vs repacked vs tiled for Q4_K
-    bench_three_way(backend, 8192, 8192, 8192, GGML_TYPE_Q4_K);
-
-    // small M (decode-like): weight unpack cost dominates at small M
-    bench_tiled_vs_std(backend, 1, 8192, 8192, GGML_TYPE_Q4_K);
-    bench_tiled_vs_std(backend, 4, 8192, 8192, GGML_TYPE_Q4_K);
-    bench_tiled_vs_std(backend, 16, 8192, 8192, GGML_TYPE_Q4_K);
-    bench_tiled_vs_std(backend, 32, 8192, 8192, GGML_TYPE_Q4_K);
-    bench_tiled_vs_std(backend, 64, 8192, 8192, GGML_TYPE_Q4_K);
+    // one timing per quant type and shape; the table compares standard,
+    // repack and tiled, with max error / RMSE vs the standard output
+    const ggml_type bench_types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
+    const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
+    struct { int64_t M, N, K; } shapes[] = {
+        { 4096, 4096, 4096 },
+        { 4096, 4096,   64 },
+    };
+    for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
+        bench_row rows[n_types];
+        for (size_t i = 0; i < n_types; ++i) {
+            rows[i] = bench_three_way(backend, shapes[s].M, shapes[s].N, shapes[s].K, bench_types[i]);
+        }
+        print_bench_table(shapes[s].M, shapes[s].N, shapes[s].K, rows, n_types);
+    }
 
     ggml_backend_free(backend);
     return 0;
