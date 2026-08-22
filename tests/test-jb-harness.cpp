@@ -548,6 +548,23 @@ int main(void) {
     test_matmul(backend, 8, 256, 8, GGML_TYPE_Q6_K);
     test_matmul(backend, 8, 512, 8, GGML_TYPE_Q6_K);
 
+    // q3_K / q2_K (SUBBLK=16): validate the new unpackers + BIAS/min correction.
+    // M>=64 engages the tiled path; the odd K probes the ragged K-tile edge.
+    test_matmul(backend, 512, 1024, 512, GGML_TYPE_Q3_K);
+    test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q3_K);
+    test_matmul(backend, 357, 1024, 137, GGML_TYPE_Q3_K);
+    test_matmul(backend, 8, 256, 8, GGML_TYPE_Q3_K);
+    test_matmul(backend, 8, 512, 8, GGML_TYPE_Q3_K);
+    test_matmul(backend, 17, 1024, 257, GGML_TYPE_Q3_K);
+    test_matmul(backend, 257, 1024, 17, GGML_TYPE_Q3_K);
+    test_matmul(backend, 512, 1024, 512, GGML_TYPE_Q2_K);
+    test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q2_K);
+    test_matmul(backend, 357, 1024, 137, GGML_TYPE_Q2_K);
+    test_matmul(backend, 8, 256, 8, GGML_TYPE_Q2_K);
+    test_matmul(backend, 8, 512, 8, GGML_TYPE_Q2_K);
+    test_matmul(backend, 17, 1024, 257, GGML_TYPE_Q2_K);
+    test_matmul(backend, 257, 1024, 17, GGML_TYPE_Q2_K);
+
     // fuzz: small M/K around tile (256) and microtile (16) boundaries
     test_matmul(backend, 1, 1024, 1, GGML_TYPE_Q4_K);
     test_matmul(backend, 2, 1024, 3, GGML_TYPE_Q4_K);

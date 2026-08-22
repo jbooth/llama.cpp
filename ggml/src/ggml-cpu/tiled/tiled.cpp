@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include <atomic>
+#include <new>
 
 #define QK_K 256 // TODO why don't we pick this up properly from headers
 
@@ -768,28 +769,45 @@ UseGgmlGemm2:;
     }
 }
 
-// === new tiled path (q4_K / q5_K, scalar + VNNI kernel) ===
+// === new tiled path (K-quants, scalar + VNNI kernel) ===
 
+// The B tile and the j-major float accumulator are identical for every A format,
+// so they are shared thread_local state; only the A tile differs (SUBBLK changes
+// the code density and the per-subblock side tables), so it is held per-format via
+// tiled_fmt_tile<Fmt>. A thread processes one op (one format) at a time, so sharing
+// acc/b across formats is safe: each window zeroes acc and each chunk rebuilds b.
 struct TiledKernelWs {
-    tiled_tile_a_q5_K * a = nullptr; // q4_K and q5_K share the tile type
-    tiled_tile_b      * b = nullptr;
-    float             * acc = nullptr;
+    tiled_tile_b * b = nullptr;
+    float        * acc = nullptr;
 
     ~TiledKernelWs() {
-        delete a;
         delete b;
-        delete[] acc;
+        // acc was allocated 64B-aligned (std::align_val_t), so free with the
+        // matching aligned delete, not delete[]
+        if (acc) ::operator delete(acc, std::align_val_t(64));
     }
 };
 
 thread_local TiledKernelWs tiled_ws;
 
+template <typename Fmt>
+struct TiledA {
+    typename tiled_fmt_tile<Fmt>::type * p = nullptr;
+    ~TiledA() { delete p; }
+};
+template <typename Fmt>
+static TiledA<Fmt> & tiled_a_holder() {
+    static thread_local TiledA<Fmt> h;
+    return h;
+}
+
 // shape/type gate; anything not supported here runs the old path
 static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
                                         const struct ggml_tensor * src1,
                                         const struct ggml_tensor * dst) {
-    // q4_K and q5_K weights only (the gateway switch grows per phase)
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) {
+    // K-quant weights only (the gateway switch grows per phase)
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q2_K) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
@@ -865,14 +883,21 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const int n_blocks = (int) (ne00 / 256);
     const size_t ldc = nb1 / nb0;
 
-    if (!tiled_ws.a) {
-        tiled_ws.a = new tiled_tile_a_q5_K();
+    TiledA<Fmt> & ah = tiled_a_holder<Fmt>();
+    if (!ah.p) {
+        ah.p = new typename tiled_fmt_tile<Fmt>::type();
     }
     if (!tiled_ws.b) {
         tiled_ws.b = new tiled_tile_b();
     }
     if (!tiled_ws.acc) {
-        tiled_ws.acc = new float[TILED_TILE_ROWS * TILED_TILE_ROWS];
+        // 64B aligned: the j-major buffer is read-modify-written with 64B vectors
+        // every k-block, and each row is 256 floats (1024B) so every access offset
+        // is a multiple of 64B. A 64B-aligned base keeps each 64B RMW inside one
+        // cache line (a misaligned 64B store would straddle two lines and dirty both).
+        tiled_ws.acc = static_cast<float *>(
+            ::operator new(sizeof(float) * (size_t) TILED_TILE_ROWS * TILED_TILE_ROWS,
+                           std::align_val_t(64)));
     }
 
     const int64_t a_stride = nb01 / src0_bs;  // blocks between A rows
@@ -912,9 +937,9 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
             // so every C element is written exactly once
             memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
             for (int b = 0; b < n_blocks; b++) {
-                tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, tiled_ws.a);
+                tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, ah.p);
                 tiled_unpack_b_q8_K(b_rows + b, b_stride, n_b, tiled_ws.b);
-                tiled_run_window(*tiled_ws.a, *tiled_ws.b, n_a, n_b, tiled_ws.acc, TILED_TILE_ROWS);
+                tiled_run_window(*ah.p, *tiled_ws.b, n_a, n_b, tiled_ws.acc, TILED_TILE_ROWS);
             }
             tiled_store_window(tiled_ws.acc, n_a, n_b, TILED_TILE_ROWS, c, ldc);
         }
@@ -1066,6 +1091,15 @@ static void tiled_matmul_gateway(const struct ggml_compute_params * params,
             break;
         case GGML_TYPE_Q5_K:
             ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q5_K>(params, dst);
+            break;
+        case GGML_TYPE_Q6_K:
+            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q6_K>(params, dst);
+            break;
+        case GGML_TYPE_Q3_K:
+            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q3_K>(params, dst);
+            break;
+        case GGML_TYPE_Q2_K:
+            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q2_K>(params, dst);
             break;
         default:
             break;
