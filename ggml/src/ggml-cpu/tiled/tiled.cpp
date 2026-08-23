@@ -442,6 +442,9 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
         // A batch coords (broadcast factors are 1 here)
         const int64_t i13 = tile_ir1 / (ne12 * ne11);
         const int64_t i12 = (tile_ir1 - i13 * ne12 * ne11) / ne11;
+        // within-batch row; c_base already holds the i12/i13 batch offset, so the
+        // row offset must use i11 (not the flattened tile_ir1, which spans all batch dims)
+        const int64_t i11 = tile_ir1 - i13 * ne12 * ne11 - i12 * ne11;
 
         const char * a_base = (const char *) src0->data + i12 * src0->nb[2] + i13 * src0->nb[3];
         char * c_base = (char *) dst->data + i12 * nb2 + i13 * nb3;
@@ -454,7 +457,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 
             const char * a_rows = a_base + tile_ir0 * nb01;
 
-            float * c = (float *) (c_base + tile_ir0 * nb0 + tile_ir1 * nb1);
+            float * c = (float *) (c_base + tile_ir0 * nb0 + i11 * nb1);
 
             // zero the j-major accumulator once per window, accumulate over all 256-K
             // blocks (each a cheap contiguous buffer add), then transpose-store to C once

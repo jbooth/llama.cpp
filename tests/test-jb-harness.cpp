@@ -150,6 +150,104 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     //if (max_err > tol) { exit(1); }
 }
 
+// Higher-dim (ne[2], ne[3] > 1) bug-for-bug check: tiled vs std.
+// std (ggml_mul_mat) is trusted as the reference; both run on the same
+// quantized weights, so any difference beyond quantization tolerance is a
+// bug in the tiled path.
+//
+// A  (src1, F32) : [N, M, a2, a3]   ne0=N (reduction), ne1=M (out0)
+// Bq (src0, quant): [N, K, b2, b3]   ne0=N (reduction), ne1=K (out1)
+// C = ggml_mul_mat(Bq, A) : [K, M, a2, a3]
+//
+// The new tiled kernel requires exact batch match (a2==b2 && a3==b3) plus
+// N%256==0 and M>=64; broadcast shapes (a2>b2 or a3>b3) fall back to the
+// explicit-dequant path. The reference additionally requires a2%b2==0 and
+// a3%b3==0 (broadcastable), which both paths here satisfy.
+void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
+                         int64_t a2, int64_t a3,
+                         int64_t b2, int64_t b3,
+                         ggml_type quant_type) {
+    srand(0x1234);
+
+    const int64_t nA = N*M*a2*a3;
+    const int64_t nB = N*K*b2*b3;
+    const int64_t nC = K*M*a2*a3;
+
+    float * A_ref   = gen_rand_f32(nA);
+    float * B_ref   = gen_rand_f32(nB);
+    float * C_std   = (float *) malloc(nC * sizeof(float));
+    float * C_tiled = (float *) malloc(nC * sizeof(float));
+
+    struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    int64_t neA[4] = { N, M, a2, a3 };
+    int64_t neB[4] = { N, K, b2, b3 };
+    struct ggml_tensor * A  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, neA);
+    struct ggml_tensor * Bq = ggml_new_tensor(ctx, quant_type,  4, neB);
+
+    struct ggml_cgraph * gf  = ggml_new_graph(ctx);
+    struct ggml_tensor * C   = ggml_mul_mat(ctx, Bq, A);
+    ggml_build_forward_expand(gf, C);
+
+    struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
+    struct ggml_tensor * C_t   = ggml_mul_mat_tiled(ctx, Bq, A);
+    ggml_build_forward_expand(gf_t, C_t);
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    // A is F32: fill the whole contiguous tensor (ne0 is the fastest dim)
+    ggml_backend_tensor_set(A, A_ref, 0, ggml_nbytes(A));
+
+    // Bq: quantize K*b2*b3 rows of N each; the rows are contiguous (ne0 fastest)
+    ggml_quantize_init(quant_type);
+    void * Bq_q = malloc(ggml_nbytes(Bq));
+    ggml_quantize_chunk(quant_type, B_ref, Bq_q, 0, K*b2*b3, N, NULL);
+    ggml_backend_tensor_set(Bq, Bq_q, 0, ggml_nbytes(Bq));
+    free(Bq_q);
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_graph_compute(backend, gf_t);
+
+    ggml_backend_tensor_get(C,   C_std,   0, ggml_nbytes(C));
+    ggml_backend_tensor_get(C_t, C_tiled, 0, ggml_nbytes(C_t));
+
+    // max |C|: scale for the quantization tolerance
+    float scale = 0.0f;
+    for (int64_t i = 0; i < nC; ++i) {
+        scale = fmaxf(scale, fabsf(C_std[i]));
+    }
+
+    // std vs tiled: identical quantized inputs, so a large difference is a bug
+    float max_err, rms_err;
+    compare_f32(C_std, C_tiled, nC, &max_err, &rms_err);
+    float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : fmaxf(1e-3f, 1e-3f*scale);
+
+    // which path did the tiled op take (mirrors ggml_tiled_matmul_supported)
+    bool tiled_kernel = (N % 256 == 0) && (M >= 64) && (a2 == b2) && (a3 == b3);
+
+    printf("TEST %lldx%lldx%lldx%lld * %lldx%lldx%lldx%lld (%s, %s): %s (max_err: %f, rms: %f, scale: %f)\n",
+           (long long)M, (long long)N, (long long)a2, (long long)a3,
+           (long long)K, (long long)N, (long long)b2, (long long)b3,
+           ggml_type_name(quant_type), tiled_kernel ? "tiled-kernel" : "explicit-fallback",
+           (max_err <= tol) ? "PASS" : "FAIL", max_err, rms_err, scale);
+
+    if (max_err > tol) {
+        int64_t shown = 0;
+        for (int64_t i = 0; i < nC && shown < 8; ++i) {
+            float err = fabsf(C_std[i] - C_tiled[i]);
+            if (err > tol) {
+                printf("  tiled vs std: i=%lld std=%f tiled=%f err=%f\n",
+                       (long long)i, C_std[i], C_tiled[i], err);
+                ++shown;
+            }
+        }
+    }
+
+    ggml_free(ctx);
+    free(A_ref); free(B_ref); free(C_std); free(C_tiled);
+}
+
 static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -375,6 +473,18 @@ int main(void) {
     test_matmul(backend, 17, 512, 17, GGML_TYPE_Q5_K);
     test_matmul(backend, 17, 512, 257, GGML_TYPE_Q5_K);
     test_matmul(backend, 257, 512, 17, GGML_TYPE_Q5_K);
+
+    // higher-dim (ne[2], ne[3] > 1): bug-for-bug vs std on identical weights.
+    // equal-batch shapes (a2==b2, a3==b3) run the new tiled kernel; the
+    // broadcast shapes (a2=2*b2) exercise the explicit-dequant fallback.
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q4_K); // 3D, tiled
+    test_matmul_highdim(backend, 1024, 1024, 1024, 1, 2, 1, 2, GGML_TYPE_Q4_K); // 3D, tiled
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled
+    test_matmul_highdim(backend,  512, 1024,  512, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled, smaller
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_K); // a2>b2, fallback
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q6_K); // 3D, tiled, q6_K
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q3_K); // 4D, tiled, q3_K
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q2_K); // 4D, tiled, q2_K
 
     // one timing per quant type and shape; the table compares standard,
     // repack and tiled, with max error / RMSE vs the standard output
