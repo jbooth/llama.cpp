@@ -256,6 +256,19 @@ static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf
     return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 }
 
+// Warm up, then time n runs and return the best (min). The box runs other CPU
+// activity, so a single timing is noisy; the min over a few runs is a stable
+// estimate of the kernel's own cost.
+static double time_graph_compute_best(ggml_backend_t backend, struct ggml_cgraph * gf, int n) {
+    time_graph_compute(backend, gf); // warmup
+    double best = 1e30;
+    for (int i = 0; i < n; ++i) {
+        const double t = time_graph_compute(backend, gf);
+        if (t < best) best = t;
+    }
+    return best;
+}
+
 // Fetch the CPU_REPACK extra buffer type through the public proc-address API,
 // the same way the model loader does. Returns NULL if repack is not built in.
 static ggml_backend_buffer_type_t get_cpu_repack_buft(void) {
@@ -347,12 +360,13 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     }
     free(A_data); free(B_data); free(B_T);
 
-    // one timing per path
-    row.time_std    = time_graph_compute(backend, gf_std);
+    // one warmup + N timings per path; best (min) wins
+    const int n_reps = 5;
+    row.time_std    = time_graph_compute_best(backend, gf_std, n_reps);
     if (row.have_repack) {
-        row.time_repack = time_graph_compute(backend, gf_repack);
+        row.time_repack = time_graph_compute_best(backend, gf_repack, n_reps);
     }
-    row.time_tiled  = time_graph_compute(backend, gf_tiled);
+    row.time_tiled  = time_graph_compute_best(backend, gf_tiled, n_reps);
 
     // errors vs the standard output (all paths use the same quantized weights)
     float * out_std    = (float *) malloc(M * K * sizeof(float));
@@ -374,7 +388,7 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
 static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row * rows, size_t n_types) {
     const double flops = 2.0 * M * N * K;
 
-    printf("\nBENCH %lldx%lld * %lldx%lld, one timing per path, 16 threads\n",
+    printf("\nBENCH %lldx%lld * %lldx%lld, min of 5 timings, 8 threads\n",
            (long long)M, (long long)N, (long long)N, (long long)K);
     printf("%-8s %10s %12s %12s %11s %11s %15s %15s %15s %15s\n",
            "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
@@ -401,7 +415,7 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
 
 int main(void) {
     ggml_backend_t backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(backend, 16);
+    ggml_backend_cpu_set_n_threads(backend, 8);
     test_matmul(backend, 512, 1024, 512, GGML_TYPE_Q6_K);
     test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q6_K);
     test_matmul(backend, 256, 1024, 8192, GGML_TYPE_Q6_K);
