@@ -2,7 +2,8 @@
 
 // Tiled matmul kernel: tile structs, unpackers, microtile kernel.
 // C++ for the per-format template config (SUBBLK, HAS_MIN, BIAS); C-style code otherwise.
-// Phase 1/2: q4_K and q5_K weights x q8_K activations (scalar + VNNI kernel).
+// K-quant weights x q8_K activations; per-ISA branches in the kernel (scalar,
+// AVX, AVX2, AVX512-VNNI).
 
 #include "ggml-quants.h"
 
@@ -95,13 +96,16 @@ inline void tiled_unpack_a(tiled_fmt_q2_K, const void * rows, int64_t row_stride
     tiled_unpack_a_q2_K((const block_q2_K *) rows, row_stride, n_rows, tile);
 }
 
-// Accumulate one (window, k-block) partial sum into a j-major float buffer
-// (row width buf_stride, j contiguous): buf[i*buf_stride + j] += partial, i < n_a, j < n_b.
-// No store to C here: the driver holds the buffer across the 256-K blocks and
-// transpose-stores it once, so each C element is written a single time.
+// Accumulate one 16x16 microtile (A rows [i0, i0+16), B cols [j0, j0+16))
+// over the full 256-K slab held in the tiles into a j-major float buffer
+// (row width buf_stride): buf[i*buf_stride + j] += partial. i0/j0 are
+// multiples of TILED_MICRO and within TILED_TILE_ROWS; rows/cols past the
+// window hold harmless tile garbage and the driver's store drops them.
+// No store to C here: the driver holds the buffer across the 256-K slabs
+// and transpose-stores it once, so each C element is written a single time.
 template <typename T> // T = tiled_tile_a<...>
-void tiled_run_window(const T & a, const tiled_tile_b & b,
-                      int n_a, int n_b, float * buf, int buf_stride);
+void tiled_run_microtile(const T & a, const tiled_tile_b & b,
+                         int i0, int j0, float * buf, int buf_stride);
 
 // Transpose-store the j-major buffer to C: C[i][j] = c[i + j*ldc] (i contiguous),
 // n_a rows x n_b cols, buffer row width buf_stride. Written with = (the buffer holds

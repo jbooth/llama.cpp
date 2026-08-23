@@ -404,7 +404,6 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
         return;
     }
 
-    const int n_blocks = (int) (ne00 / 256);
     const size_t ldc = nb1 / nb0;
 
     TiledA<Fmt> & ah = tiled_a_holder<Fmt>();
@@ -427,11 +426,15 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const int64_t a_stride = nb01 / src0_bs;  // blocks between A rows
     const int64_t b_stride = (src1->type == vec_dot_type ? src1->nb[1] : row_size) / src1_bs;
 
-    // slide 256-wide windows across the band, clamped at the band edges and at the
-    // ne11 boundaries so the A batch index is constant within a window; advance by the
-    // clamped window end (not a fixed 256) so no rows are skipped at a batch boundary
+    const int64_t TILE = 256;
+    const int64_t MICRO = 16;
+
+    // === logical 256x256 tiles (macrotiles) ===
+    // The ir1 macrotile is additionally clamped at the A batch (ne11) boundary:
+    // the tiles require a constant batch index (i12/i13) within one window. Advance
+    // by the clamped end (not a fixed 256) so no rows are skipped at a batch boundary.
     for (int64_t tile_ir1 = ir1_start; tile_ir1 < ir1_end; ) {
-        int64_t tile_ir1_end = MIN(tile_ir1 + 256, ir1_end);
+        int64_t tile_ir1_end = MIN(tile_ir1 + TILE, ir1_end);
         const int64_t bnd = (tile_ir1 / ne11 + 1) * ne11;
         if (bnd < tile_ir1_end) {
             tile_ir1_end = bnd;
@@ -439,7 +442,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 
         const int n_b = (int) (tile_ir1_end - tile_ir1);
 
-        // A batch coords (broadcast factors are 1 here)
+        // A batch coords (constant within the clamped window)
         const int64_t i13 = tile_ir1 / (ne12 * ne11);
         const int64_t i12 = (tile_ir1 - i13 * ne12 * ne11) / ne11;
         // within-batch row; c_base already holds the i12/i13 batch offset, so the
@@ -451,23 +454,39 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 
         const block_q8_K * b_rows = (const block_q8_K *) ((const char *) wdata + tile_ir1 * b_stride * src1_bs);
 
-        for (int64_t tile_ir0 = ir0_start; tile_ir0 < ir0_end; tile_ir0 += 256) {
-            const int64_t tile_ir0_end = MIN(tile_ir0 + 256, ir0_end);
+        for (int64_t tile_ir0 = ir0_start; tile_ir0 < ir0_end; tile_ir0 += TILE) {
+            const int64_t tile_ir0_end = MIN(tile_ir0 + TILE, ir0_end);
             const int n_a = (int) (tile_ir0_end - tile_ir0);
 
             const char * a_rows = a_base + tile_ir0 * nb01;
 
             float * c = (float *) (c_base + tile_ir0 * nb0 + i11 * nb1);
 
-            // zero the j-major accumulator once per window, accumulate over all 256-K
-            // blocks (each a cheap contiguous buffer add), then transpose-store to C once
-            // so every C element is written exactly once
+            // j-major buffer: zeroed once per macrotile, accumulated over all slabs and
+            // microtiles (each a cheap contiguous add), then transposed into C once so
+            // every C element is written exactly once (a per-microtile strided C RMW
+            // measured ~30% of runtime)
             memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
-            for (int b = 0; b < n_blocks; b++) {
+
+            // Compute tiles of length 256 towards our NXN output block
+            for (int64_t ib = 0; ib < ne00; ib += TILE) {
+                const int b = (int) (ib / TILE);
                 tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, ah.p);
                 tiled_unpack_b_q8_K(b_rows + b, b_stride, n_b, tiled_ws.b);
-                tiled_run_window(*ah.p, *tiled_ws.b, n_a, n_b, tiled_ws.acc, TILED_TILE_ROWS);
+
+                for (int64_t iir1 = tile_ir1; iir1 < tile_ir1_end; iir1 += MICRO) {
+                    for (int64_t iir0 = tile_ir0; iir0 < tile_ir0_end; iir0 += MICRO) {
+                        // 16x16 microtile window over the macrotile (tile-local coords);
+                        // the kernel processes the full 16x16 unconditionally, rows/cols
+                        // past the window edges hold harmless tile garbage (B rows are
+                        // zero-padded at unpack) and the store below drops them
+                        tiled_run_microtile(*ah.p, *tiled_ws.b,
+                            (int) (iir0 - tile_ir0), (int) (iir1 - tile_ir1),
+                            tiled_ws.acc, TILED_TILE_ROWS);
+                    }
+                }
             }
+
             tiled_store_window(tiled_ws.acc, n_a, n_b, TILED_TILE_ROWS, c, ldc);
         }
         tile_ir1 = tile_ir1_end;
