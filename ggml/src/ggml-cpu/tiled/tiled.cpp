@@ -14,284 +14,6 @@
 
 #define QK_K 256 // TODO why don't we pick this up properly from headers
 
-static void ggml_compute_forward_mul_mat_one_chunk_tiled_explicit_dequant(
-    const struct ggml_compute_params * params,
-    struct ggml_tensor * dst,
-    const enum ggml_type type,
-    const int64_t ir0_start,
-    const int64_t ir0_end,
-    const int64_t ir1_start,
-    const int64_t ir1_end) {
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
-
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-
-    const size_t nb01 = src0->nb[1];
-    const size_t nb02 = src0->nb[2];
-    const size_t nb03 = src0->nb[3];
-
-    const size_t nb11 = src1->nb[1];
-    const size_t nb12 = src1->nb[2];
-    const size_t nb13 = src1->nb[3];
-
-    const size_t nb1  = dst->nb[1];
-    const size_t nb2  = dst->nb[2];
-    const size_t nb3  = dst->nb[3];
-
-    const bool src1_cont = ggml_is_contiguous(src1);
-
-    ggml_vec_dot_t const vec_dot      = ggml_get_type_traits_cpu(type)->vec_dot;
-    enum ggml_type const vec_dot_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
-
-    const size_t src0_bs = ggml_type_size(type);
-    const size_t src1_bs = ggml_type_size(vec_dot_type);
-
-    const int64_t r2 = ne12 / ne02;
-    const int64_t r3 = ne13 / ne03;
-
-    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
-        return;
-    }
-
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-    GGML_ASSERT(ne00 % QK_K == 0);
-
-    const int64_t TILE = 256;
-    const int64_t MICRO = 16;
-
-    float tmp[256]; // partial microtile (used per K block)
-
-    // === logical 256x256 tiles ===
-    for (int64_t tile_ir1 = ir1_start; tile_ir1 < ir1_end; tile_ir1 += TILE) {
-        for (int64_t tile_ir0 = ir0_start; tile_ir0 < ir0_end; tile_ir0 += TILE) {
-
-            const int64_t tile_ir1_end = MIN(tile_ir1 + TILE, ir1_end);
-            const int64_t tile_ir0_end = MIN(tile_ir0 + TILE, ir0_end);
-            // Compute tiles of length 256 towards our NXN output block
-            for (int64_t ib = 0; ib < ne00; ib += QK_K) {
-                for (int64_t iir1 = tile_ir1; iir1 < tile_ir1_end; iir1 += MICRO) {
-                    for (int64_t iir0 = tile_ir0; iir0 < tile_ir0_end; iir0 += MICRO) {
-
-                        const int64_t micro_ir1_end = MIN(iir1 + MICRO, tile_ir1_end);
-                        const int64_t micro_ir0_end = MIN(iir0 + MICRO, tile_ir0_end);
-
-                        memset(tmp, 0, sizeof(tmp));
-
-                        for (int64_t ir1 = iir1; ir1 < micro_ir1_end; ++ir1) {
-
-                            const int64_t i13 = ir1 / (ne12 * ne11);
-                            const int64_t i12 = (ir1 - i13 * ne12 * ne11) / ne11;
-                            const int64_t i11 = ir1 - i13 * ne12 * ne11 - i12 * ne11;
-
-                            const int64_t i03 = i13 / r3;
-                            const int64_t i02 = i12 / r2;
-
-                            const char * src0_row =
-                                (const char *) src0->data +
-                                i02 * nb02 + i03 * nb03 +
-                                (ib / QK_K) * src0_bs;
-
-                            const char * src1_col =
-                                (const char *) wdata +
-                                (src1_cont || src1->type != vec_dot_type
-                                    ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
-                                    : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-
-                            src1_col += (ib / QK_K) * src1_bs;
-
-                            for (int64_t ir0 = iir0; ir0 < micro_ir0_end; ++ir0) {
-                                vec_dot(
-                                    QK_K,
-                                    &tmp[(ir0 - iir0) + ((ir1 - iir1) * MICRO)],
-                                    0,
-                                    src0_row + ir0 * nb01,
-                                    0,
-                                    src1_col,
-                                    0,
-                                    1);
-                            }
-                        }
-
-                        // === STAGE 1b: accumulate directly into dst ===
-                        for (int64_t ir1 = iir1; ir1 < micro_ir1_end; ++ir1) {
-
-                            const int64_t i13 = ir1 / (ne12 * ne11);
-                            const int64_t i12 = (ir1 - i13 * ne12 * ne11) / ne11;
-                            const int64_t i11 = ir1 - i13 * ne12 * ne11 - i12 * ne11;
-
-                            float * dst_col =
-                                (float *) ((char *) dst->data +
-                                           i11 * nb1 + i12 * nb2 + i13 * nb3);
-
-                            float * acc = &tmp[(ir1 - iir1) * MICRO];
-
-                            for (int64_t ir0 = iir0; ir0 < micro_ir0_end; ++ir0) {
-                                dst_col[ir0] += acc[ir0 - iir0];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-static void ggml_compute_forward_mul_mat_tiled_explicit_dequant(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    const int64_t ne01 = src0->ne[1];
-    const size_t nb00 = src0->nb[0];
-
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-    const size_t nb10 = src1->nb[0];
-    const size_t nb11 = src1->nb[1];
-    const size_t nb12 = src1->nb[2];
-    const size_t nb13 = src1->nb[3];
-
-    const int64_t ne0 = dst->ne[0];
-    const int64_t ne1 = dst->ne[1];
-    const int64_t ne2 = dst->ne[2];
-    const int64_t ne3 = dst->ne[3];
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
-    const size_t nb2 = dst->nb[2];
-    const size_t nb3 = dst->nb[3];
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    enum ggml_type const vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
-    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
-
-    GGML_ASSERT(ne0 == ne01);
-    GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
-
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    // nb01 >= nb00 - src0 is not transposed
-    //   compute by src0 rows
-
-    if (src1->type != vec_dot_type) {
-        char * wdata = (char *) params->wdata;
-
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-    }
-
-    if (ith == 0) {
-        // result is accumulated with += below, so it must start at zero
-        memset(dst->data, 0, nb0 * ne0 * ne1 * ne2 * ne3);
-    }
-
-    if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        ggml_threadpool_chunk_set(params->threadpool, nth);
-    }
-
-    ggml_barrier(params->threadpool);
-
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const int64_t nr0 = ne0;
-
-    // This is the size of the rest of the dimensions of the result
-    const int64_t nr1 = ne1 * ne2 * ne3;
-
-    // Now select a reasonable chunk size.
-    int chunk_size = 256;
-
-    // distribute the work across the inner or outer loop based on which one is larger
-    // The number of chunks in the 0/1 dim.
-    // CEIL(nr0/chunk_size)
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-    // Step down chunk size if too few chunks
-    while (nchunk0 * nchunk1 < nth * 4 && chunk_size > 16) {
-        chunk_size = chunk_size / 2;
-        nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-    }
-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
-    }
-
-    // The number of elements in each chunk
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
-    // The first chunk comes from our thread_id, the rest will get auto-assigned.
-    int current_chunk = ith;
-
-    while (current_chunk < nchunk0 * nchunk1) {
-        const int64_t ith0 = current_chunk % nchunk0;
-        const int64_t ith1 = current_chunk / nchunk0;
-
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-
-        const int64_t ir1_start = dr1 * ith1;
-        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-
-        ggml_compute_forward_mul_mat_one_chunk_tiled_explicit_dequant(params, dst, src0->type, ir0_start, ir0_end, ir1_start, ir1_end);
-
-        if (nth >= nchunk0 * nchunk1) {
-            break;
-        }
-
-        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
-    }
-}
-
 
 // === new tiled path (K-quants, scalar + VNNI kernel) ===
 
@@ -380,9 +102,12 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int64_t ne00 = src0->ne[0];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
 
     const size_t nb01 = src0->nb[1];
 
@@ -449,7 +174,15 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
         // row offset must use i11 (not the flattened tile_ir1, which spans all batch dims)
         const int64_t i11 = tile_ir1 - i13 * ne12 * ne11 - i12 * ne11;
 
-        const char * a_base = (const char *) src0->data + i12 * src0->nb[2] + i13 * src0->nb[3];
+        // dst batches == src1 batches (ggml_mul_mat_tiled), so the loop batch
+        // coords are in src1 space; src0 batches are broadcast over them
+        // (ne02|ne12, ne03|ne13), map down into src0's own batch for the A tile
+        const int64_t r2 = ne12 / ne02;
+        const int64_t r3 = ne13 / ne03;
+        const int64_t i02 = i12 / r2;
+        const int64_t i03 = i13 / r3;
+
+        const char * a_base = (const char *) src0->data + i02 * src0->nb[2] + i03 * src0->nb[3];
         char * c_base = (char *) dst->data + i12 * nb2 + i13 * nb3;
 
         const block_q8_K * b_rows = (const block_q8_K *) ((const char *) wdata + tile_ir1 * b_stride * src1_bs);
@@ -655,10 +388,6 @@ static void tiled_matmul_gateway(const struct ggml_compute_params * params,
 void ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
-    if (ggml_tiled_matmul_supported(dst->src[0], dst->src[1], dst)) {
-        tiled_matmul_gateway(params, dst);
-        return;
-    }
 
-    ggml_compute_forward_mul_mat_tiled_explicit_dequant(params, dst);
+    tiled_matmul_gateway(params, dst);
 }
