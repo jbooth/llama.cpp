@@ -41,7 +41,7 @@ static void fill_tensor(struct ggml_tensor * t, const float * src, int64_t src_r
     float * tmp_f32 = (float *) malloc(src_rows * src_cols * sizeof(float));
 
     // Transfer data: This is essentially a transpose if you consider
-    // how GGML views memory vs standard C row-major.
+    // how GGML views memory vs standard dst row-major.
     for (int64_t r = 0; r < src_rows; ++r) {
         for (int64_t c = 0; c < src_cols; ++c) {
             // GGML stores rows contiguously.
@@ -66,66 +66,66 @@ static void fill_tensor(struct ggml_tensor * t, const float * src, int64_t src_r
 void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
     srand(0x1234);
 
-    float * A_ref = gen_rand_f32(M * N);
-    float * B_ref = gen_rand_f32(N * K);
-    float * C_out = (float *) malloc(M * K * sizeof(float));
-    float * C_tiled = (float *) malloc(M * K * sizeof(float));
+    float * src1_ref = gen_rand_f32(M * N);
+    float * src0_ref = gen_rand_f32(N * K);
+    float * dst_out = (float *) malloc(M * K * sizeof(float));
+    float * dst_tiled = (float *) malloc(M * K * sizeof(float));
 
     struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
     struct ggml_context * ctx = ggml_init(ip);
 
     // LOGIC:
-    // Reference: C(M,K) = A(M,N) * B(N,K)
+    // Reference: dst(M,K) = src1(M,N) * src0(N,K)
     // GGML mul_mat(t0, t1) computes t1 * t0^T.
-    // So we want: A(M,N) * Bq(K,N)^T
-    // t1 (A)  shape: ne0=N, ne1=M  (Transposed view of A_ref)
-    // t0 (Bq) shape: ne0=N, ne1=K  (Transposed view of B_ref)
+    // So we want: src1(M,N) * src0(K,N)^T
+    // t1 (src1)  shape: ne0=N, ne1=M  (Transposed view of src1_ref)
+    // t0 (src0) shape: ne0=N, ne1=K  (Transposed view of src0_ref)
 
-    struct ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
-    struct ggml_tensor * Bq = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+    struct ggml_tensor * src1  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    struct ggml_tensor * src0 = ggml_new_tensor_2d(ctx, quant_type,   N, K);
 
     struct ggml_cgraph * gf  = ggml_new_graph(ctx);
-    struct ggml_tensor * C   = ggml_mul_mat(ctx, Bq, A);
-    ggml_build_forward_expand(gf, C);
+    struct ggml_tensor * dst   = ggml_mul_mat(ctx, src0, src1);
+    ggml_build_forward_expand(gf, dst);
 
     struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
-    struct ggml_tensor * C_t   = ggml_mul_mat_tiled(ctx, Bq, A);
-    ggml_build_forward_expand(gf_t, C_t);
+    struct ggml_tensor * dst_t   = ggml_mul_mat_tiled(ctx, src0, src1);
+    ggml_build_forward_expand(gf_t, dst_t);
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    // A_ref is M rows, N cols. GGML A is N wide, M high.
-    fill_tensor(A, A_ref, M, N, GGML_TYPE_F32);
+    // src1_ref is M rows, N cols. GGML src1 is N wide, M high.
+    fill_tensor(src1, src1_ref, M, N, GGML_TYPE_F32);
 
-    // B_ref is N rows, K cols.
-    // To make GGML Bq (N wide, K high), we must treat B_ref as K rows of N.
-    // We effectively transpose B_ref here.
-    float * B_ref_T = (float *) malloc(N * K * sizeof(float));
+    // src0_ref is N rows, K cols.
+    // To make GGML src0 (N wide, K high), we must treat src0_ref as K rows of N.
+    // We effectively transpose src0_ref here.
+    float * src0_ref_T = (float *) malloc(N * K * sizeof(float));
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t k = 0; k < K; ++k) {
-            B_ref_T[k * N + n] = B_ref[n * K + k];
+            src0_ref_T[k * N + n] = src0_ref[n * K + k];
         }
     }
-    fill_tensor(Bq, B_ref_T, K, N, quant_type);
+    fill_tensor(src0, src0_ref_T, K, N, quant_type);
 
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_graph_compute(backend, gf_t);
 
-    // C is (K, M). Result C_ref is (M, K). Read rows of C into C_out.
+    // dst is (K, M). Result dst_ref is (M, K). Read rows of dst into dst_out.
     for (int64_t i = 0; i < M; ++i) {
-        ggml_backend_tensor_get(C,   C_out + i*K,   i * C->nb[1], K * sizeof(float));
-        ggml_backend_tensor_get(C_t, C_tiled + i*K,   i * C_t->nb[1], K * sizeof(float));
+        ggml_backend_tensor_get(dst,   dst_out + i*K,   i * dst->nb[1], K * sizeof(float));
+        ggml_backend_tensor_get(dst_t, dst_tiled + i*K,   i * dst_t->nb[1], K * sizeof(float));
     }
 
-    // max |C|: used as scale for quantization tolerance
+    // max |dst|: used as scale for quantization tolerance
     float scale = 0.0f;
     for (int64_t i = 0; i < M*K; ++i) {
-        scale = fmaxf(scale, fabsf(C_out[i]));
+        scale = fmaxf(scale, fabsf(dst_out[i]));
     }
 
     // std vs tiled: identical quantized inputs, so any large difference here is a bug in the tiled kernel
     float max_err, rms_err;
-    compare_f32(C_out, C_tiled, M*K, &max_err, &rms_err);
+    compare_f32(dst_out, dst_tiled, M*K, &max_err, &rms_err);
     float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : fmaxf(1e-3f, 1e-3f * scale);
 
     printf("TEST %lldx%lld * %lldx%lld (%s): %s (max_err: %f, rms: %f, scale: %f)\n",
@@ -136,17 +136,17 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     if (max_err > tol) {
         int64_t shown = 0;
         for (int64_t i = 0; i < M*K && shown < 8; ++i) {
-            float err = fabsf(C_out[i] - C_tiled[i]);
+            float err = fabsf(dst_out[i] - dst_tiled[i]);
             if (err > tol) {
                 printf("  tiled vs std: i=%lld (m=%lld k=%lld) std=%f tiled=%f err=%f\n",
-                       (long long)i, (long long)(i/K), (long long)(i%K), C_out[i], C_tiled[i], err);
+                       (long long)i, (long long)(i/K), (long long)(i%K), dst_out[i], dst_tiled[i], err);
                 ++shown;
             }
         }
     }
 
     ggml_free(ctx);
-    free(A_ref); free(B_ref); free(B_ref_T); free(C_out); free(C_tiled);
+    free(src1_ref); free(src0_ref); free(src0_ref_T); free(dst_out); free(dst_tiled);
     //if (max_err > tol) { exit(1); }
 }
 
@@ -155,97 +155,97 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
 // quantized weights, so any difference beyond quantization tolerance is a
 // bug in the tiled path.
 //
-// A  (src1, F32) : [N, M, a2, a3]   ne0=N (reduction), ne1=M (out0)
-// Bq (src0, quant): [N, K, b2, b3]   ne0=N (reduction), ne1=K (out1)
-// C = ggml_mul_mat(Bq, A) : [K, M, a2, a3]
+// src1 (F32)  : [N, M, src1_2, src1_3]   ne0=N (reduction), ne1=M (out0)
+// src0 (quant): [N, K, src0_2, src0_3]   ne0=N (reduction), ne1=K (out1)
+// dst = ggml_mul_mat(src0, src1) : [K, M, src1_2, src1_3]
 //
-// The new tiled kernel requires exact batch match (a2==b2 && a3==b3) plus
-// N%256==0 and M>=64; broadcast shapes (a2>b2 or a3>b3) fall back to the
-// explicit-dequant path. The reference additionally requires a2%b2==0 and
-// a3%b3==0 (broadcastable), which both paths here satisfy.
+// The new tiled kernel requires exact batch match (src1_2==src0_2 && src1_3==src0_3) plus
+// N%256==0 and M>=64; broadcast shapes (src1_2>src0_2 or src1_3>src0_3) fall back to the
+// explicit-dequant path. The reference additionally requires src1_2%src0_2==0 and
+// src1_3%src0_3==0 (broadcastable), which both paths here satisfy.
 void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
-                         int64_t a2, int64_t a3,
-                         int64_t b2, int64_t b3,
+                         int64_t src1_2, int64_t src1_3,
+                         int64_t src0_2, int64_t src0_3,
                          ggml_type quant_type) {
     srand(0x1234);
 
-    const int64_t nA = N*M*a2*a3;
-    const int64_t nB = N*K*b2*b3;
-    const int64_t nC = K*M*a2*a3;
+    const int64_t n_src1 = N*M*src1_2*src1_3;
+    const int64_t n_src0 = N*K*src0_2*src0_3;
+    const int64_t n_dst = K*M*src1_2*src1_3;
 
-    float * A_ref   = gen_rand_f32(nA);
-    float * B_ref   = gen_rand_f32(nB);
-    float * C_std   = (float *) malloc(nC * sizeof(float));
-    float * C_tiled = (float *) malloc(nC * sizeof(float));
+    float * src1_ref   = gen_rand_f32(n_src1);
+    float * src0_ref   = gen_rand_f32(n_src0);
+    float * dst_std   = (float *) malloc(n_dst * sizeof(float));
+    float * dst_tiled = (float *) malloc(n_dst * sizeof(float));
 
     struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
     struct ggml_context * ctx = ggml_init(ip);
 
-    int64_t neA[4] = { N, M, a2, a3 };
-    int64_t neB[4] = { N, K, b2, b3 };
-    struct ggml_tensor * A  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, neA);
-    struct ggml_tensor * Bq = ggml_new_tensor(ctx, quant_type,  4, neB);
+    int64_t ne_src1[4] = { N, M, src1_2, src1_3 };
+    int64_t ne_src0[4] = { N, K, src0_2, src0_3 };
+    struct ggml_tensor * src1  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_src1);
+    struct ggml_tensor * src0 = ggml_new_tensor(ctx, quant_type,  4, ne_src0);
 
     struct ggml_cgraph * gf  = ggml_new_graph(ctx);
-    struct ggml_tensor * C   = ggml_mul_mat(ctx, Bq, A);
-    ggml_build_forward_expand(gf, C);
+    struct ggml_tensor * dst   = ggml_mul_mat(ctx, src0, src1);
+    ggml_build_forward_expand(gf, dst);
 
     struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
-    struct ggml_tensor * C_t   = ggml_mul_mat_tiled(ctx, Bq, A);
-    ggml_build_forward_expand(gf_t, C_t);
+    struct ggml_tensor * dst_t   = ggml_mul_mat_tiled(ctx, src0, src1);
+    ggml_build_forward_expand(gf_t, dst_t);
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    // A is F32: fill the whole contiguous tensor (ne0 is the fastest dim)
-    ggml_backend_tensor_set(A, A_ref, 0, ggml_nbytes(A));
+    // src1 is F32: fill the whole contiguous tensor (ne0 is the fastest dim)
+    ggml_backend_tensor_set(src1, src1_ref, 0, ggml_nbytes(src1));
 
-    // Bq: quantize K*b2*b3 rows of N each; the rows are contiguous (ne0 fastest)
+    // src0: quantize K*src0_2*src0_3 rows of N each; the rows are contiguous (ne0 fastest)
     ggml_quantize_init(quant_type);
-    void * Bq_q = malloc(ggml_nbytes(Bq));
-    ggml_quantize_chunk(quant_type, B_ref, Bq_q, 0, K*b2*b3, N, NULL);
-    ggml_backend_tensor_set(Bq, Bq_q, 0, ggml_nbytes(Bq));
-    free(Bq_q);
+    void * src0_q = malloc(ggml_nbytes(src0));
+    ggml_quantize_chunk(quant_type, src0_ref, src0_q, 0, K*src0_2*src0_3, N, NULL);
+    ggml_backend_tensor_set(src0, src0_q, 0, ggml_nbytes(src0));
+    free(src0_q);
 
     ggml_backend_graph_compute(backend, gf);
     ggml_backend_graph_compute(backend, gf_t);
 
-    ggml_backend_tensor_get(C,   C_std,   0, ggml_nbytes(C));
-    ggml_backend_tensor_get(C_t, C_tiled, 0, ggml_nbytes(C_t));
+    ggml_backend_tensor_get(dst,   dst_std,   0, ggml_nbytes(dst));
+    ggml_backend_tensor_get(dst_t, dst_tiled, 0, ggml_nbytes(dst_t));
 
-    // max |C|: scale for the quantization tolerance
+    // max |dst|: scale for the quantization tolerance
     float scale = 0.0f;
-    for (int64_t i = 0; i < nC; ++i) {
-        scale = fmaxf(scale, fabsf(C_std[i]));
+    for (int64_t i = 0; i < n_dst; ++i) {
+        scale = fmaxf(scale, fabsf(dst_std[i]));
     }
 
     // std vs tiled: identical quantized inputs, so a large difference is a bug
     float max_err, rms_err;
-    compare_f32(C_std, C_tiled, nC, &max_err, &rms_err);
+    compare_f32(dst_std, dst_tiled, n_dst, &max_err, &rms_err);
     float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : fmaxf(1e-3f, 1e-3f*scale);
 
     // which path did the tiled op take (mirrors ggml_tiled_matmul_supported)
-    bool tiled_kernel = (N % 256 == 0) && (M >= 64) && (a2 == b2) && (a3 == b3);
+    bool tiled_kernel = (N % 256 == 0) && (M >= 64) && (src1_2 == src0_2) && (src1_3 == src0_3);
 
     printf("TEST %lldx%lldx%lldx%lld * %lldx%lldx%lldx%lld (%s, %s): %s (max_err: %f, rms: %f, scale: %f)\n",
-           (long long)M, (long long)N, (long long)a2, (long long)a3,
-           (long long)K, (long long)N, (long long)b2, (long long)b3,
+           (long long)M, (long long)N, (long long)src1_2, (long long)src1_3,
+           (long long)K, (long long)N, (long long)src0_2, (long long)src0_3,
            ggml_type_name(quant_type), tiled_kernel ? "tiled-kernel" : "explicit-fallback",
            (max_err <= tol) ? "PASS" : "FAIL", max_err, rms_err, scale);
 
     if (max_err > tol) {
         int64_t shown = 0;
-        for (int64_t i = 0; i < nC && shown < 8; ++i) {
-            float err = fabsf(C_std[i] - C_tiled[i]);
+        for (int64_t i = 0; i < n_dst && shown < 8; ++i) {
+            float err = fabsf(dst_std[i] - dst_tiled[i]);
             if (err > tol) {
                 printf("  tiled vs std: i=%lld std=%f tiled=%f err=%f\n",
-                       (long long)i, C_std[i], C_tiled[i], err);
+                       (long long)i, dst_std[i], dst_tiled[i], err);
                 ++shown;
             }
         }
     }
 
     ggml_free(ctx);
-    free(A_ref); free(B_ref); free(C_std); free(C_tiled);
+    free(src1_ref); free(src0_ref); free(dst_std); free(dst_tiled);
 }
 
 static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
@@ -302,7 +302,7 @@ struct bench_row {
 // (whose set_tensor repacks the raw quants, and whose kernel is selected
 // because the weight lives in that buffer type). The repack column is only
 // available where a repack kernel exists for the type (x86: q4_K, q2_K);
-// init_tensor sets Bq_rep->extra to the repack layout or NULL.
+// init_tensor sets src0_rep->extra to the repack layout or NULL.
 static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
     bench_row row;
     row.name = ggml_type_name(quant_type);
@@ -313,52 +313,52 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     struct ggml_init_params ip = { .mem_size = 1024*1024*1024, .no_alloc = true };
     struct ggml_context * ctx = ggml_init(ip);
 
-    struct ggml_tensor * A      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
-    struct ggml_tensor * Bq_std = ggml_new_tensor_2d(ctx, quant_type,   N, K);
-    struct ggml_tensor * Bq_rep = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+    struct ggml_tensor * src1      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
+    struct ggml_tensor * src0_std = ggml_new_tensor_2d(ctx, quant_type,   N, K);
+    struct ggml_tensor * src0_rep = ggml_new_tensor_2d(ctx, quant_type,   N, K);
 
     struct ggml_cgraph * gf_std   = ggml_new_graph(ctx);
-    struct ggml_tensor * C_std    = ggml_mul_mat(ctx, Bq_std, A);
-    ggml_build_forward_expand(gf_std, C_std);
+    struct ggml_tensor * dst_std    = ggml_mul_mat(ctx, src0_std, src1);
+    ggml_build_forward_expand(gf_std, dst_std);
 
     struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
-    struct ggml_tensor * C_tiled  = ggml_mul_mat_tiled(ctx, Bq_std, A);
-    ggml_build_forward_expand(gf_tiled, C_tiled);
+    struct ggml_tensor * dst_tiled  = ggml_mul_mat_tiled(ctx, src0_std, src1);
+    ggml_build_forward_expand(gf_tiled, dst_tiled);
 
     struct ggml_cgraph * gf_repack = ggml_new_graph(ctx);
-    struct ggml_tensor * C_repack  = ggml_mul_mat(ctx, Bq_rep, A);
-    ggml_build_forward_expand(gf_repack, C_repack);
+    struct ggml_tensor * dst_repack  = ggml_mul_mat(ctx, src0_rep, src1);
+    ggml_build_forward_expand(gf_repack, dst_repack);
 
-    // Put Bq_rep into the repack buffer before the bulk allocation so the
+    // Put src0_rep into the repack buffer before the bulk allocation so the
     // allocator treats it as pre-allocated and leaves it out of the default buffer.
     // repack 8x8 layout requires N (ne0) and K (ne1) to be multiples of 8.
     ggml_backend_buffer_type_t repack_buft = get_cpu_repack_buft();
     if (repack_buft && N % 8 == 0 && K % 8 == 0) {
-        ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(Bq_rep));
-        Bq_rep->buffer = buf_rep;
-        Bq_rep->data   = ggml_backend_buffer_get_base(buf_rep);
-        ggml_backend_buffer_init_tensor(buf_rep, Bq_rep);
-        row.have_repack = (Bq_rep->extra != NULL);
+        ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(src0_rep));
+        src0_rep->buffer = buf_rep;
+        src0_rep->data   = ggml_backend_buffer_get_base(buf_rep);
+        ggml_backend_buffer_init_tensor(buf_rep, src0_rep);
+        row.have_repack = (src0_rep->extra != NULL);
     }
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    float * A_data = gen_rand_f32(M * N);
-    float * B_data = gen_rand_f32(N * K);
-    // Bq is K rows of N in ggml layout, so transpose B into it
-    float * B_T = (float *) malloc(N * K * sizeof(float));
+    float * src1_data = gen_rand_f32(M * N);
+    float * src0_data = gen_rand_f32(N * K);
+    // src0 is K rows of N in ggml layout, so transpose src0 into it
+    float * src0_T = (float *) malloc(N * K * sizeof(float));
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t k = 0; k < K; ++k) {
-            B_T[k * N + n] = B_data[n * K + k];
+            src0_T[k * N + n] = src0_data[n * K + k];
         }
     }
-    fill_tensor(A,      A_data, M, N, GGML_TYPE_F32);
-    fill_tensor(Bq_std, B_T,    K, N, quant_type);
+    fill_tensor(src1,      src1_data, M, N, GGML_TYPE_F32);
+    fill_tensor(src0_std, src0_T,    K, N, quant_type);
     if (row.have_repack) {
         // same raw quants; the repack buffer's set_tensor repacks them in-place
-        fill_tensor(Bq_rep, B_T,    K, N, quant_type);
+        fill_tensor(src0_rep, src0_T,    K, N, quant_type);
     }
-    free(A_data); free(B_data); free(B_T);
+    free(src1_data); free(src0_data); free(src0_T);
 
     // one warmup + N timings per path; best (min) wins
     const int n_reps = 5;
@@ -372,10 +372,10 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     float * out_std    = (float *) malloc(M * K * sizeof(float));
     float * out_tiled  = (float *) malloc(M * K * sizeof(float));
     float * out_repack = (float *) malloc(M * K * sizeof(float));
-    ggml_backend_tensor_get(C_std,   out_std,   0, ggml_nbytes(C_std));
-    ggml_backend_tensor_get(C_tiled, out_tiled, 0, ggml_nbytes(C_tiled));
+    ggml_backend_tensor_get(dst_std,   out_std,   0, ggml_nbytes(dst_std));
+    ggml_backend_tensor_get(dst_tiled, out_tiled, 0, ggml_nbytes(dst_tiled));
     if (row.have_repack) {
-        ggml_backend_tensor_get(C_repack, out_repack, 0, ggml_nbytes(C_repack));
+        ggml_backend_tensor_get(dst_repack, out_repack, 0, ggml_nbytes(dst_repack));
         compare_f32(out_std, out_repack, M * K, &row.max_err_repack, &row.rmse_repack);
     }
     compare_f32(out_std, out_tiled, M * K, &row.max_err_tiled, &row.rmse_tiled);
@@ -489,13 +489,13 @@ int main(void) {
     test_matmul(backend, 257, 512, 17, GGML_TYPE_Q5_K);
 
     // higher-dim (ne[2], ne[3] > 1): bug-for-bug vs std on identical weights.
-    // equal-batch shapes (a2==b2, a3==b3) run the new tiled kernel; the
-    // broadcast shapes (a2=2*b2) exercise the explicit-dequant fallback.
+    // equal-batch shapes (src1_2==src0_2, src1_3==src0_3) run the new tiled kernel; the
+    // broadcast shapes (src1_2=2*src0_2) exercise the explicit-dequant fallback.
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q4_K); // 3D, tiled
     test_matmul_highdim(backend, 1024, 1024, 1024, 1, 2, 1, 2, GGML_TYPE_Q4_K); // 3D, tiled
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled
     test_matmul_highdim(backend,  512, 1024,  512, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled, smaller
-    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_K); // a2>b2, fallback
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_K); // src1_2>src0_2, fallback
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q6_K); // 3D, tiled, q6_K
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q3_K); // 4D, tiled, q3_K
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q2_K); // 4D, tiled, q2_K

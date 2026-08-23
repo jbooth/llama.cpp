@@ -17,17 +17,17 @@
 
 // === new tiled path (K-quants, scalar + VNNI kernel) ===
 
-// The B tile and the j-major float accumulator are identical for every A format,
-// so they are shared thread_local state; only the A tile differs (SUBBLK changes
+// The src1 tile and the j-major float accumulator are identical for every src0 format,
+// so they are shared thread_local state; only the src0 tile differs (SUBBLK changes
 // the code density and the per-subblock side tables), so it is held per-format via
 // tiled_fmt_tile<Fmt>. A thread processes one op (one format) at a time, so sharing
 // acc/b across formats is safe: each window zeroes acc and each chunk rebuilds b.
 struct TiledKernelWs {
-    tiled_tile_b * b = nullptr;
+    tiled_tile_src1 * src1 = nullptr;
     float        * acc = nullptr;
 
     ~TiledKernelWs() {
-        delete b;
+        delete src1;
         // acc was allocated 64B-aligned (std::align_val_t), so free with the
         // matching aligned delete, not delete[]
         if (acc) ::operator delete(acc, std::align_val_t(64));
@@ -37,13 +37,13 @@ struct TiledKernelWs {
 thread_local TiledKernelWs tiled_ws;
 
 template <typename Fmt>
-struct TiledA {
+struct TiledSrc0 {
     typename tiled_fmt_tile<Fmt>::type * p = nullptr;
-    ~TiledA() { delete p; }
+    ~TiledSrc0() { delete p; }
 };
 template <typename Fmt>
-static TiledA<Fmt> & tiled_a_holder() {
-    static thread_local TiledA<Fmt> h;
+static TiledSrc0<Fmt> & tiled_src0_holder() {
+    static thread_local TiledSrc0<Fmt> h;
     return h;
 }
 
@@ -76,7 +76,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
         src1->ne[2] != src0->ne[2] || src1->ne[3] != src0->ne[3]) {
         return false;
     }
-    // B rows must be addressable as contiguous rows (wdata is contiguous by construction)
+    // src1 rows must be addressable as contiguous rows (wdata is contiguous by construction)
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
         return false;
     }
@@ -131,12 +131,12 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 
     const size_t ldc = nb1 / nb0;
 
-    TiledA<Fmt> & ah = tiled_a_holder<Fmt>();
+    TiledSrc0<Fmt> & ah = tiled_src0_holder<Fmt>();
     if (!ah.p) {
         ah.p = new typename tiled_fmt_tile<Fmt>::type();
     }
-    if (!tiled_ws.b) {
-        tiled_ws.b = new tiled_tile_b();
+    if (!tiled_ws.src1) {
+        tiled_ws.src1 = new tiled_tile_src1();
     }
     if (!tiled_ws.acc) {
         // 64B aligned: the j-major buffer is read-modify-written with 64B vectors
@@ -148,81 +148,81 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
                            std::align_val_t(64)));
     }
 
-    const int64_t a_stride = nb01 / src0_bs;  // blocks between A rows
-    const int64_t b_stride = (src1->type == vec_dot_type ? src1->nb[1] : row_size) / src1_bs;
+    const int64_t src0_stride = nb01 / src0_bs;  // blocks between src0 rows
+    const int64_t src1_stride = (src1->type == vec_dot_type ? src1->nb[1] : row_size) / src1_bs;
 
     const int64_t TILE = 256;
     const int64_t MICRO = 16;
 
     // === logical 256x256 tiles (macrotiles) ===
-    // The ir1 macrotile is additionally clamped at the A batch (ne11) boundary:
+    // The ir1 macrotile is additionally clamped at the src0 batch (ne11) boundary:
     // the tiles require a constant batch index (i12/i13) within one window. Advance
     // by the clamped end (not a fixed 256) so no rows are skipped at a batch boundary.
-    for (int64_t tile_ir1 = ir1_start; tile_ir1 < ir1_end; ) {
-        int64_t tile_ir1_end = MIN(tile_ir1 + TILE, ir1_end);
-        const int64_t bnd = (tile_ir1 / ne11 + 1) * ne11;
-        if (bnd < tile_ir1_end) {
-            tile_ir1_end = bnd;
+    for (int64_t tile_n1 = ir1_start; tile_n1 < ir1_end; ) {
+        int64_t tile_n1_end = MIN(tile_n1 + TILE, ir1_end);
+        const int64_t bnd = (tile_n1 / ne11 + 1) * ne11;
+        if (bnd < tile_n1_end) {
+            tile_n1_end = bnd;
         }
 
-        const int n_b = (int) (tile_ir1_end - tile_ir1);
+        const int n_src1 = (int) (tile_n1_end - tile_n1);
 
-        // A batch coords (constant within the clamped window)
-        const int64_t i13 = tile_ir1 / (ne12 * ne11);
-        const int64_t i12 = (tile_ir1 - i13 * ne12 * ne11) / ne11;
-        // within-batch row; c_base already holds the i12/i13 batch offset, so the
-        // row offset must use i11 (not the flattened tile_ir1, which spans all batch dims)
-        const int64_t i11 = tile_ir1 - i13 * ne12 * ne11 - i12 * ne11;
+        // src0 batch coords (constant within the clamped window)
+        const int64_t i13 = tile_n1 / (ne12 * ne11);
+        const int64_t i12 = (tile_n1 - i13 * ne12 * ne11) / ne11;
+        // within-batch row; dst_base already holds the i12/i13 batch offset, so the
+        // row offset must use i11 (not the flattened tile_n1, which spans all batch dims)
+        const int64_t i11 = tile_n1 - i13 * ne12 * ne11 - i12 * ne11;
 
         // dst batches == src1 batches (ggml_mul_mat_tiled), so the loop batch
         // coords are in src1 space; src0 batches are broadcast over them
-        // (ne02|ne12, ne03|ne13), map down into src0's own batch for the A tile
+        // (ne02|ne12, ne03|ne13), map down into src0's own batch for the src0 tile
         const int64_t r2 = ne12 / ne02;
         const int64_t r3 = ne13 / ne03;
         const int64_t i02 = i12 / r2;
         const int64_t i03 = i13 / r3;
 
-        const char * a_base = (const char *) src0->data + i02 * src0->nb[2] + i03 * src0->nb[3];
-        char * c_base = (char *) dst->data + i12 * nb2 + i13 * nb3;
+        const char * src0_base = (const char *) src0->data + i02 * src0->nb[2] + i03 * src0->nb[3];
+        char * dst_base = (char *) dst->data + i12 * nb2 + i13 * nb3;
 
-        const block_q8_K * b_rows = (const block_q8_K *) ((const char *) wdata + tile_ir1 * b_stride * src1_bs);
+        const block_q8_K * src1_rows = (const block_q8_K *) ((const char *) wdata + tile_n1 * src1_stride * src1_bs);
 
-        for (int64_t tile_ir0 = ir0_start; tile_ir0 < ir0_end; tile_ir0 += TILE) {
-            const int64_t tile_ir0_end = MIN(tile_ir0 + TILE, ir0_end);
-            const int n_a = (int) (tile_ir0_end - tile_ir0);
+        for (int64_t tile_n0 = ir0_start; tile_n0 < ir0_end; tile_n0 += TILE) {
+            const int64_t tile_n0_end = MIN(tile_n0 + TILE, ir0_end);
+            const int n_src0 = (int) (tile_n0_end - tile_n0);
 
-            const char * a_rows = a_base + tile_ir0 * nb01;
+            const char * src0_rows = src0_base + tile_n0 * nb01;
 
-            float * c = (float *) (c_base + tile_ir0 * nb0 + i11 * nb1);
+            float * c_curr = (float *) (dst_base + tile_n0 * nb0 + i11 * nb1);
 
             // j-major buffer: zeroed once per macrotile, accumulated over all slabs and
-            // microtiles (each a cheap contiguous add), then transposed into C once so
-            // every C element is written exactly once (a per-microtile strided C RMW
+            // microtiles (each a cheap contiguous add), then transposed into dst once so
+            // every dst element is written exactly once (a per-microtile strided dst RMW
             // measured ~30% of runtime)
             memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
 
             // Compute tiles of length 256 towards our NXN output block
             for (int64_t ib = 0; ib < ne00; ib += TILE) {
-                const int b = (int) (ib / TILE);
-                tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, ah.p);
-                tiled_unpack_b_q8_K(b_rows + b, b_stride, n_b, tiled_ws.b);
+                const int kblk = (int) (ib / TILE);
+                tiled_unpack_src0(Fmt(), src0_rows + kblk * src0_bs, src0_stride, n_src0, ah.p);
+                tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_src1, tiled_ws.src1);
 
-                for (int64_t iir0 = tile_ir0; iir0 < tile_ir0_end; iir0 += MICRO) {
-                    for (int64_t iir1 = tile_ir1; iir1 < tile_ir1_end; iir1 += MICRO) {
+                for (int64_t iir0 = tile_n0; iir0 < tile_n0_end; iir0 += MICRO) {
+                    for (int64_t iir1 = tile_n1; iir1 < tile_n1_end; iir1 += MICRO) {
                         // 16x16 microtile window over the macrotile (tile-local coords);
                         // the kernel processes the full 16x16 unconditionally, rows/cols
-                        // past the window edges hold harmless tile garbage (B rows are
+                        // past the window edges hold harmless tile garbage (src1 rows are
                         // zero-padded at unpack) and the store below drops them
-                        tiled_run_microtile(*ah.p, *tiled_ws.b,
-                            (int) (iir0 - tile_ir0), (int) (iir1 - tile_ir1),
+                        tiled_run_microtile(*ah.p, *tiled_ws.src1,
+                            (int) (iir0 - tile_n0), (int) (iir1 - tile_n1),
                             tiled_ws.acc, TILED_TILE_ROWS);
                     }
                 }
             }
 
-            tiled_store_window(tiled_ws.acc, n_a, n_b, TILED_TILE_ROWS, c, ldc);
+            tiled_store_window(tiled_ws.acc, n_src0, n_src1, TILED_TILE_ROWS, c_curr, ldc);
         }
-        tile_ir1 = tile_ir1_end;
+        tile_n1 = tile_n1_end;
     }
 }
 
