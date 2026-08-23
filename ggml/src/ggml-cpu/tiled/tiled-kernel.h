@@ -16,12 +16,18 @@
 
 // B tile: activation side, built from q8_K (wdata), shared by all A formats.
 // Rows are padded to a multiple of 16 (zeroed) so column microtiles are dense.
+// q and qv alias the same 64KB and are never both active: the scalar/AVX2
+// bodies read q ([row][k]), the VNNI body reads qv ([k/4][row][4], 16 rows x
+// 4B contiguous per k-group, the dpbusd 16-lane operand). The unpacker
+// builds whichever one its own build's kernel consumes.
 // Members are 64B aligned so the base (and every member, whose offsets are
 // multiples of 64B) is cache-line aligned: the VNNI kernel reads qv and d with
 // 64B vectors, and a 64B access at a non-64B offset straddles two cache lines.
 struct tiled_tile_b {
-    alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];            // signed q8 codes, natural [row][k]
-    alignas(64) int8_t  qv[(TILED_TILE_K / 4) * TILED_TILE_ROWS * 4]; // VNNI interleaved [k/4][row][4]
+    union {
+        alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];            // signed q8 codes, natural [row][k]
+        alignas(64) int8_t  qv[(TILED_TILE_K / 4) * TILED_TILE_ROWS * 4]; // VNNI interleaved [k/4][row][4]
+    };
     alignas(64) int16_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS]; // s-major per-16 sums, [s][row]
     float       d[TILED_TILE_ROWS];
 };

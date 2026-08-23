@@ -207,8 +207,8 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
                 tiled_unpack_a(Fmt(), a_rows + b * src0_bs, a_stride, n_a, ah.p);
                 tiled_unpack_b_q8_K(b_rows + b, b_stride, n_b, tiled_ws.b);
 
-                for (int64_t iir1 = tile_ir1; iir1 < tile_ir1_end; iir1 += MICRO) {
-                    for (int64_t iir0 = tile_ir0; iir0 < tile_ir0_end; iir0 += MICRO) {
+                for (int64_t iir0 = tile_ir0; iir0 < tile_ir0_end; iir0 += MICRO) {
+                    for (int64_t iir1 = tile_ir1; iir1 < tile_ir1_end; iir1 += MICRO) {
                         // 16x16 microtile window over the macrotile (tile-local coords);
                         // the kernel processes the full 16x16 unconditionally, rows/cols
                         // past the window edges hold harmless tile garbage (B rows are

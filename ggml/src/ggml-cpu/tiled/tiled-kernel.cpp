@@ -220,6 +220,53 @@ void tiled_unpack_a_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows
 void tiled_unpack_b_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_b * tile) {
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
     const int n_qv = TILED_TILE_K / 4;
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    // The VNNI body reads only qv, never q, so on this build we build qv alone.
+    // Each 64B block (k-group x 16 rows) is one 16-lane 4B gather over the
+    // natural row storage plus one full 64B store. The per-lane int32 index is
+    // arbitrary, so this also covers strided rows (long B rows). The old per-row
+    // 64 x 4B scatter into the 1KB-strided qv layout cost over 20% of the whole
+    // GEMM; the gather builds each 64B output block directly.
+    // row_off[r] = int32 index (scale 4) of rows[r].qs[0]: byte offset
+    // r * row_stride * 292 + 4, divided by 4 (d is the first member, 4B).
+    // row_stride * 73 stays in int32 for any realistic row count.
+    static_assert(sizeof(block_q8_K) == 292, "block_q8_K size changed, fix the gather indices below");
+    static_assert(offsetof(block_q8_K, qs) == 4, "block_q8_K qs offset changed, fix the gather indices below");
+    {
+        const int32_t s73 = (int32_t) row_stride * 73;
+        int32_t row_off[TILED_MICRO];
+        for (int r = 0; r < TILED_MICRO; r++) row_off[r] = r * s73 + 1;
+        const __m512i idx_row = _mm512_loadu_si512((const __m512i *) row_off);
+        const int32_t * base = (const int32_t *) rows;
+        for (int r0 = 0; r0 < n_padded; r0 += TILED_MICRO) {
+            const int n = (n_rows > r0) ? n_rows - r0 : 0;
+            const __mmask16 k = (n >= TILED_MICRO) ? 0xffff : ((__mmask16) ((1u << n) - 1));
+            const __m512i base_idx = _mm512_set1_epi32(r0 * s73);
+            for (int g = 0; g < n_qv; g++) {
+                const __m512i idx = _mm512_add_epi32(_mm512_add_epi32(idx_row, base_idx), _mm512_set1_epi32(g));
+                const __m512i v = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), k, idx, base, 4);
+                _mm512_storeu_si512((void *) &tile->qv[g * TILED_TILE_ROWS * 4 + r0 * 4], v);
+            }
+            for (int r = r0; r < r0 + TILED_MICRO; r++) {
+                if (r < n_rows) {
+                    const block_q8_K & xb = rows[r * row_stride];
+                    for (int s = 0; s < TILED_TILE_K / 16; s++) {
+                        tile->bsums[s * TILED_TILE_ROWS + r] = xb.bsums[s];
+                    }
+                    tile->d[r] = xb.d;
+                } else {
+                    for (int s = 0; s < TILED_TILE_K / 16; s++) {
+                        tile->bsums[s * TILED_TILE_ROWS + r] = 0;
+                    }
+                    tile->d[r] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+    // non-VNNI build: the scalar/AVX2 bodies read q ([row][k]); qv is not built
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & xb = rows[r * row_stride];
