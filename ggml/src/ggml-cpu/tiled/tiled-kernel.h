@@ -12,17 +12,9 @@
 
 #define TILED_TILE_K    256 // one QK_K block
 #define TILED_TILE_ROWS 256 // max window rows, ragged at edges
-#define TILED_MICRO     16  // microtile edge
+#define TILED_MICRO     16  // microtile edge (also the bsums code-sum granularity)
 
-// src1 tile: activation side, built from q8_K (wdata), shared by all src0 formats.
-// Rows are padded to a multiple of 16 (zeroed) so column microtiles are dense.
-// q and qv alias the same 64KB and are never both active: the scalar/AVX2
-// bodies read q ([row][k]), the VNNI body reads qv ([k/4][row][4], 16 rows x
-// 4B contiguous per k-group, the dpbusd 16-lane operand). The unpacker
-// builds whichever one its own build's kernel consumes.
-// Members are 64B aligned so the base (and every member, whose offsets are
-// multiples of 64B) is cache-line aligned: the VNNI kernel reads qv and d with
-// 64B vectors, and a 64B access at a non-64B offset straddles two cache lines.
+// src1 tile: built from q8_K (wdata), shared by all src0 formats.
 struct tiled_tile_src1 {
     union {
         alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];            // signed q8 codes, natural [row][k]
@@ -47,13 +39,14 @@ struct tiled_tile_src0 {
     float    d[TILED_TILE_ROWS];
     float    dmin[TILED_TILE_ROWS];         // used when HAS_MIN
     // per-subblock side coefficients, one (row, s) pair each, applied per exact integer
-    // subblock dot:  out += d * sc[r][s] * dot(codes)  -  dmin * mn[r][s] * sum(src1 codes)
-    // sc scales the int code dot, mn scales the src1-side code sum (tile->bsums); mn is
-    // only used by HAS_MIN formats (q2/q4/q5_K). q3_K stores sc as (raw 6-bit scale - 32)
-    // (its q1 code offset is handled via BIAS). q6_K uses only sc.
+    // subblock dot:  out += d * scales[r][s] * dot(codes)  -  dmin * mins[r][s] * sum(src1 codes)
+    // scales (the model block's scales field) scales the int code dot, mins scales the src1-side
+    // code sum (tile->bsums); mins is only used by HAS_MIN formats (q2/q4/q5_K). q3_K stores
+    // scales as (raw 6-bit scale - 32) (its q1 code offset is handled via BIAS). q6_K uses
+    // only scales.
     // int32 though the values fit int8: broadcast straight from memory, no per-use sign-extend (12.9)
-    int32_t   sc[TILED_TILE_ROWS * NB];      // per-subblock scale (q3_K: stored as raw-32)
-    int32_t   mn[TILED_TILE_ROWS * NB];      // per-subblock min, used when HAS_MIN
+    int32_t   scales[TILED_TILE_ROWS * NB];  // per-subblock scale (q3_K: stored as raw-32)
+    int32_t   mins[TILED_TILE_ROWS * NB];      // per-subblock min, used when HAS_MIN
     // NB: a BIAS != 0 format needs NO src0-side code sum. sum(src1 codes) with c = u - BIAS
     // = sum(u*src1 code) - BIAS*sum(src1 code): the bias term is BIAS times the src1-side per-subblock
     // bsum (tile_src1->bsums), which the kernel already combines. No src0 sumq is stored.
@@ -96,19 +89,19 @@ void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_r
 void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile);
 // src1 unpack: n_rows <= TILED_TILE_ROWS rows, row r at rows + r*row_stride (in blocks).
 // d and bsums always come from the natural q8_K rows; the VNNI build takes the
-// codes from the one-shot interleaved region (qv_glob) when provided, else builds
-// them per call (r_glob = global index of the window's first row, kblk = slab)
+// codes from the one-shot interleaved region (qv) when provided, else builds
+// them per call (r_start = global index of the window's first row, kblk = slab)
 void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
-                            const int8_t * qv_glob, int64_t n_rows_pad, int64_t r_glob, int64_t kblk);
+                            const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
 
 // One-shot, all threads: scatter the whole src1 tensor's q8 codes into the flat
 // [slab][k/4-in-slab][row][4] region (one code byte per element, rows padded to
-// 16 and zeroed past n_rows). d and bsums stay in the natural layout. Each call
-// covers rows [r_start, r_end) (16-aligned, may reach n_rows_pad), so callers
+// 16 and zeroed past nr1). d and bsums stay in the natural layout. Each call
+// covers rows [r_start, r_end) (16-aligned, may reach nr1_pad), so callers
 // split the tensor into row groups per thread
 void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
                                 int64_t r_start, int64_t r_end,
-                                int64_t n_k, int64_t n_rows, int64_t n_rows_pad, int8_t * qv_glob);
+                                int64_t n_k, int64_t nr1, int64_t nr1_pad, int8_t * qv);
 
 // tag-dispatched unpack: rows is the base of one (window, k-block), cast to the format's block type
 inline void tiled_unpack_src0(tiled_fmt_q4_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
@@ -138,7 +131,7 @@ template <typename T> // T = tiled_tile_src0<...>
 void tiled_run_microtile(const T & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride);
 
-// Transpose-store the j-major buffer to dst: dst[i][j] = c[i + j*ldc] (i contiguous),
+// Transpose-store the j-major buffer to dst: dst[i][j] = dst[i + j*dst_stride] (i contiguous),
 // n_src0 rows x n_src1 cols, buffer row width buf_stride. Written with = (the buffer holds
 // the full sum for the window and the region is thread-exclusive).
-void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride, float * c, size_t ldc);
+void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride, float * dst, size_t dst_stride);

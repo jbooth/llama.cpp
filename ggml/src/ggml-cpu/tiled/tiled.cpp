@@ -22,29 +22,31 @@
 // the code density and the per-subblock side tables), so it is held per-format via
 // tiled_fmt_tile<Fmt>. A thread processes one op (one format) at a time, so sharing
 // acc/b across formats is safe: each window zeroes acc and each chunk rebuilds b.
-struct TiledKernelWs {
+struct tiled_kernel_ws {
     tiled_tile_src1 * src1 = nullptr;
     float        * acc = nullptr;
 
-    ~TiledKernelWs() {
+    ~tiled_kernel_ws() {
         delete src1;
         // acc was allocated 64B-aligned (std::align_val_t), so free with the
         // matching aligned delete, not delete[]
-        if (acc) ::operator delete(acc, std::align_val_t(64));
+        if (acc) {
+            ::operator delete(acc, std::align_val_t(64));
+        }
     }
 };
 
-thread_local TiledKernelWs tiled_ws;
+static thread_local tiled_kernel_ws tiled_ws;
 
 template <typename Fmt>
-struct TiledSrc0 {
-    typename tiled_fmt_tile<Fmt>::type * p = nullptr;
-    ~TiledSrc0() { delete p; }
+struct tiled_src0_slot {
+    typename tiled_fmt_tile<Fmt>::type * tile = nullptr;
+    ~tiled_src0_slot() { delete tile; }
 };
 template <typename Fmt>
-static TiledSrc0<Fmt> & tiled_src0_holder() {
-    static thread_local TiledSrc0<Fmt> h;
-    return h;
+static tiled_src0_slot<Fmt> & tiled_get_src0_slot() {
+    static thread_local tiled_src0_slot<Fmt> s;
+    return s;
 }
 
 // shape/type gate; anything not supported here runs the old path
@@ -99,7 +101,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
 // unpack falls back to the per-call gather.
 struct tiled_src1_interleave {
     const int8_t * qv;    // interleave region base, null when not built
-    int64_t r1_pad;       // row count padded to 16 (0 when not built)
+    int64_t nr1_pad;      // row count padded to 16 (0 when not built)
 };
 
 static tiled_src1_interleave tiled_prepare_src1_interleave(
@@ -107,7 +109,7 @@ static tiled_src1_interleave tiled_prepare_src1_interleave(
         const struct ggml_tensor * src1,
         enum ggml_type vec_dot_type,
         int64_t ne10,
-        int64_t r1,
+        int64_t nr1,
         int ith,
         int nth) {
     tiled_src1_interleave res = { nullptr, 0 };
@@ -116,42 +118,42 @@ static tiled_src1_interleave tiled_prepare_src1_interleave(
     (void) src1;
     (void) vec_dot_type;
     (void) ne10;
-    (void) r1;
+    (void) nr1;
     (void) ith;
     (void) nth;
     return res;
 #endif
-    res.r1_pad = (r1 + 15) & ~15LL;
+    res.nr1_pad = (nr1 + 15) & ~15LL;
     const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
     int8_t * qv;
     const block_q8_K * src1_codes;
-    int64_t row_stride1;
+    int64_t src1_stride;
     if (src1->type != vec_dot_type) {
         ggml_barrier(params->threadpool);
-        const size_t off = ggml_row_size(vec_dot_type, ne10) * (size_t) r1;
-        GGML_ASSERT(params->wsize >= off + (size_t) k1_pad * res.r1_pad);
+        const size_t off = ggml_row_size(vec_dot_type, ne10) * (size_t) nr1;
+        GGML_ASSERT(params->wsize >= off + (size_t) k1_pad * res.nr1_pad);
         qv = (int8_t *) ((char *) params->wdata + off);
         src1_codes = (const block_q8_K *) params->wdata;
-        row_stride1 = ne10 / 256; // wdata rows are contiguous 256 blocks
+        src1_stride = ne10 / 256; // wdata rows are contiguous 256 blocks
     } else {
-        GGML_ASSERT(params->wsize >= (size_t) k1_pad * res.r1_pad);
+        GGML_ASSERT(params->wsize >= (size_t) k1_pad * res.nr1_pad);
         qv = (int8_t *) params->wdata;
         src1_codes = (const block_q8_K *) src1->data;
-        row_stride1 = src1->nb[1] / sizeof(block_q8_K);
+        src1_stride = src1->nb[1] / sizeof(block_q8_K);
     }
-    const int64_t n_groups = res.r1_pad / 16;
+    const int64_t n_groups = res.nr1_pad / 16;
     const int64_t g0 = (int64_t) ith * n_groups / nth;
     const int64_t g1 = (int64_t) (ith + 1) * n_groups / nth;
     for (int64_t g = g0; g < g1; g++) {
-        tiled_interleave_src1_q8_K(src1_codes + g * 16 * row_stride1, row_stride1,
-                                   g * 16, (g + 1) * 16, k1_pad, r1, res.r1_pad, qv);
+        tiled_interleave_src1_q8_K(src1_codes + g * 16 * src1_stride, src1_stride,
+                                   g * 16, (g + 1) * 16, k1_pad, nr1, res.nr1_pad, qv);
     }
     res.qv = qv;
     return res;
 }
 
 template <typename Fmt>
-static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
+static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
     const int64_t ir0_start,
@@ -193,12 +195,12 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 
     const size_t ldc = nb1 / nb0;
 
-    const int8_t * qv_glob = src1_inter.qv;
-    const int64_t r1_pad = src1_inter.r1_pad;
+    const int8_t * qv = src1_inter.qv;
+    const int64_t nr1_pad = src1_inter.nr1_pad;
 
-    TiledSrc0<Fmt> & ah = tiled_src0_holder<Fmt>();
-    if (!ah.p) {
-        ah.p = new typename tiled_fmt_tile<Fmt>::type();
+    tiled_src0_slot<Fmt> & slot = tiled_get_src0_slot<Fmt>();
+    if (!slot.tile) {
+        slot.tile = new typename tiled_fmt_tile<Fmt>::type();
     }
     if (!tiled_ws.src1) {
         tiled_ws.src1 = new tiled_tile_src1();
@@ -269,10 +271,10 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
             // Compute tiles of length 256 towards our NXN output block
             for (int64_t ib = 0; ib < ne00; ib += TILE) {
                 const int kblk = (int) (ib / TILE);
-                tiled_unpack_src0(Fmt(), src0_rows + kblk * src0_bs, src0_stride, n_src0, ah.p);
+                tiled_unpack_src0(Fmt(), src0_rows + kblk * src0_bs, src0_stride, n_src0, slot.tile);
                 // tile_n1 is the flattened global row index of the window's first row
                 tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_src1, tiled_ws.src1,
-                                       qv_glob, r1_pad, tile_n1, kblk);
+                                       qv, nr1_pad, tile_n1, kblk);
 
                 for (int64_t iir0 = tile_n0; iir0 < tile_n0_end; iir0 += MICRO) {
                     for (int64_t iir1 = tile_n1; iir1 < tile_n1_end; iir1 += MICRO) {
@@ -280,7 +282,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
                         // the kernel processes the full 16x16 unconditionally, rows/cols
                         // past the window edges hold harmless tile garbage (src1 rows are
                         // zero-padded at unpack) and the store below drops them
-                        tiled_run_microtile(*ah.p, *tiled_ws.src1,
+                        tiled_run_microtile(*slot.tile, *tiled_ws.src1,
                             (int) (iir0 - tile_n0), (int) (iir1 - tile_n1),
                             tiled_ws.acc, TILED_TILE_ROWS);
                     }
@@ -294,7 +296,7 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
 }
 
 template <typename Fmt>
-static void ggml_compute_forward_mul_mat_tiled_new(
+static void ggml_compute_forward_mul_mat_tiled_fmt(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
@@ -423,8 +425,8 @@ static void ggml_compute_forward_mul_mat_tiled_new(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk_tiled_new<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end,
-                                                              src1_inter);
+        ggml_compute_forward_mul_mat_tiled_one_chunk<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end,
+                                                          src1_inter);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -434,32 +436,26 @@ static void ggml_compute_forward_mul_mat_tiled_new(
     }
 }
 
-static void tiled_matmul_gateway(const struct ggml_compute_params * params,
-                                 struct ggml_tensor * dst) {
+void ggml_compute_forward_mul_mat_tiled(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
     switch (dst->src[0]->type) {
         case GGML_TYPE_Q4_K:
-            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q4_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q4_K>(params, dst);
             break;
         case GGML_TYPE_Q5_K:
-            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q5_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q5_K>(params, dst);
             break;
         case GGML_TYPE_Q6_K:
-            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q6_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q6_K>(params, dst);
             break;
         case GGML_TYPE_Q3_K:
-            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q3_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q3_K>(params, dst);
             break;
         case GGML_TYPE_Q2_K:
-            ggml_compute_forward_mul_mat_tiled_new<tiled_fmt_q2_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q2_K>(params, dst);
             break;
         default:
             break;
     }
-}
-
-void ggml_compute_forward_mul_mat_tiled(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
-
-    tiled_matmul_gateway(params, dst);
 }
