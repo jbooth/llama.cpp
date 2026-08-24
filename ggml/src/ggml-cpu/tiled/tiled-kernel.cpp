@@ -217,22 +217,80 @@ void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_r
     }
 }
 
-void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile) {
+void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
+                                int64_t r_start, int64_t r_end,
+                                int64_t n_k, int64_t n_rows, int64_t n_rows_pad, int8_t * qv_glob) {
+    // n_k is the region width in elements (already slab-padded by the caller);
+    // the last slab may be partial and its excess groups read the row's tail
+    const int64_t n_slabs = n_k / TILED_TILE_K;
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    // the per-call VNNI unpack shape (16-lane 4B gather + 64B store per
+    // k-group x 16-row block), run once over the whole tensor
+    static_assert(sizeof(block_q8_K) == 292, "block_q8_K size changed, fix the gather indices below");
+    static_assert(offsetof(block_q8_K, qs) == 4, "block_q8_K qs offset changed, fix the gather indices below");
+    {
+        // row_off[r] = int32 index (scale 4) of rows[r].qs[0] (d is 4B, qs at +4);
+        // row_stride * 73 stays in int32 for any realistic row count
+        const int32_t s73 = (int32_t) row_stride * 73;
+        int32_t row_off[TILED_MICRO];
+        for (int r = 0; r < TILED_MICRO; r++) row_off[r] = r * s73 + 1;
+        const __m512i idx_row = _mm512_loadu_si512((const __m512i *) row_off);
+        const int32_t * base = (const int32_t *) rows;
+        for (int64_t r0 = r_start; r0 < r_end; r0 += TILED_MICRO) {
+            // masked lanes (past n_rows) gather into the zero register, so the
+            // 16-row pad tail of the region is zeroed here, no separate memset
+            const int64_t n = (n_rows > r0) ? n_rows - r0 : 0;
+            const __mmask16 k = (n >= TILED_MICRO) ? 0xffff : ((__mmask16) ((1u << n) - 1));
+            const int64_t rl = r0 - r_start; // rows points at global row r_start
+            for (int64_t s = 0; s < n_slabs; s++) {
+                // block (row rl, slab s) is rl*row_stride + s blocks from rows
+                const __m512i base_idx = _mm512_set1_epi32((int32_t) ((rl * row_stride + s) * 73));
+                int8_t * out = qv_glob + s * TILED_TILE_K * n_rows_pad + r0 * 4;
+                for (int g = 0; g < 64; g++) {
+                    const __m512i idx = _mm512_add_epi32(_mm512_add_epi32(idx_row, base_idx), _mm512_set1_epi32(g));
+                    const __m512i v = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), k, idx, base, 4);
+                    _mm512_storeu_si512((void *) (out + g * n_rows_pad * 4), v);
+                }
+            }
+        }
+        return;
+    }
+#endif
+    // non-VNNI build: same region layout (the driver only calls this on VNNI builds)
+    for (int64_t r0 = r_start; r0 < r_end; r0 += TILED_MICRO) {
+        for (int64_t r = r0; r < r0 + TILED_MICRO; r++) {
+            for (int64_t s = 0; s < n_slabs; s++) {
+                int8_t * out = qv_glob + (s * TILED_TILE_K) * n_rows_pad + r * 4;
+                if (r < n_rows) {
+                    const block_q8_K & x = rows[(r - r_start) * row_stride + s];
+                    for (int g = 0; g < 64; g++) {
+                        memcpy(out + g * n_rows_pad * 4, x.qs + g * 4, 4);
+                    }
+                } else {
+                    for (int g = 0; g < 64; g++) {
+                        memset(out + g * n_rows_pad * 4, 0, 4);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
+                            const int8_t * qv_glob, int64_t n_rows_pad, int64_t r_glob, int64_t kblk) {
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
     const int n_qv = TILED_TILE_K / 4;
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
     // The VNNI body reads only qv, never q, so on this build we build qv alone.
-    // Each 64B block (k-group x 16 rows) is one 16-lane 4B gather over the
-    // natural row storage plus one full 64B store. The per-lane int32 index is
-    // arbitrary, so this also covers strided rows (long src1 rows). The old per-row
-    // 64 x 4B scatter into the 1KB-strided qv layout cost over 20% of the whole
-    // GEMM; the gather builds each 64B output block directly.
-    // row_off[r] = int32 index (scale 4) of rows[r].qs[0]: byte offset
-    // r * row_stride * 292 + 4, divided by 4 (d is the first member, 4B).
-    // row_stride * 73 stays in int32 for any realistic row count.
-    static_assert(sizeof(block_q8_K) == 292, "block_q8_K size changed, fix the gather indices below");
-    static_assert(offsetof(block_q8_K, qs) == 4, "block_q8_K qs offset changed, fix the gather indices below");
-    {
+    if (qv_glob) {
+        // the tensor was interleaved once (tiled_interleave_src1_q8_K): the tile
+        // column is 4 bytes per row, contiguous; rows past n_rows read the
+        // zeroed pad tail of the region
+        for (int g = 0; g < n_qv; g++) {
+            memcpy(&tile->qv[g * TILED_TILE_ROWS * 4],
+                   qv_glob + ((int64_t) (kblk * n_qv + g) * n_rows_pad + r_glob) * 4, (size_t) n_padded * 4);
+        }
+    } else {
         const int32_t s73 = (int32_t) row_stride * 73;
         int32_t row_off[TILED_MICRO];
         for (int r = 0; r < TILED_MICRO; r++) row_off[r] = r * s73 + 1;
@@ -247,35 +305,30 @@ void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_r
                 const __m512i v = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), k, idx, base, 4);
                 _mm512_storeu_si512((void *) &tile->qv[g * TILED_TILE_ROWS * 4 + r0 * 4], v);
             }
-            for (int r = r0; r < r0 + TILED_MICRO; r++) {
-                if (r < n_rows) {
-                    const block_q8_K & x = rows[r * row_stride];
-                    for (int s = 0; s < TILED_TILE_K / 16; s++) {
-                        tile->bsums[s * TILED_TILE_ROWS + r] = x.bsums[s];
-                    }
-                    tile->d[r] = x.d;
-                } else {
-                    for (int s = 0; s < TILED_TILE_K / 16; s++) {
-                        tile->bsums[s * TILED_TILE_ROWS + r] = 0;
-                    }
-                    tile->d[r] = 0.0f;
-                }
-            }
         }
-        return;
     }
 #endif
-
+    // d and bsums: natural layout, every build
+    for (int r = 0; r < n_padded; r++) {
+        if (r < n_rows) {
+            const block_q8_K & x = rows[r * row_stride];
+            for (int s = 0; s < TILED_TILE_K / 16; s++) {
+                tile->bsums[s * TILED_TILE_ROWS + r] = x.bsums[s];
+            }
+            tile->d[r] = x.d;
+        } else {
+            for (int s = 0; s < TILED_TILE_K / 16; s++) {
+                tile->bsums[s * TILED_TILE_ROWS + r] = 0;
+            }
+            tile->d[r] = 0.0f;
+        }
+    }
+#if !defined(__AVX512VNNI__) || !defined(__AVX512VL__) || !defined(__AVX512DQ__)
     // non-VNNI build: the scalar/AVX2 bodies read q ([row][k]); qv is not built
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & x = rows[r * row_stride];
             memcpy(&tile->q[r * TILED_TILE_K], x.qs, TILED_TILE_K);
-            // bsums is s-major: one contiguous 32B vector per (s, 16-row j-tile) for the kernel combine
-            for (int s = 0; s < TILED_TILE_K / 16; s++) {
-                tile->bsums[s * TILED_TILE_ROWS + r] = x.bsums[s];
-            }
-            tile->d[r] = x.d;
             // VNNI interleaved copy: [k/4][row][4], a 32B-aligned row-tile load per k/4 group
             const int8_t * qs = x.qs;
             for (int g = 0; g < n_qv; g++) {
@@ -283,15 +336,12 @@ void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_r
             }
         } else {
             memset(&tile->q[r * TILED_TILE_K], 0, TILED_TILE_K);
-            for (int s = 0; s < TILED_TILE_K / 16; s++) {
-                tile->bsums[s * TILED_TILE_ROWS + r] = 0;
-            }
-            tile->d[r] = 0.0f;
             for (int g = 0; g < n_qv; g++) {
                 memset(&tile->qv[g * TILED_TILE_ROWS * 4 + r * 4], 0, 4);
             }
         }
     }
+#endif
 }
 
 template <typename T>

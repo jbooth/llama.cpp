@@ -83,7 +83,21 @@ void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, int n_r
 void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile);
 void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile);
 void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile);
-void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile);
+// src1 unpack: n_rows <= TILED_TILE_ROWS rows, row r at rows + r*row_stride (in blocks).
+// d and bsums always come from the natural q8_K rows; the VNNI build takes the
+// codes from the one-shot interleaved region (qv_glob) when provided, else builds
+// them per call (r_glob = global index of the window's first row, kblk = slab)
+void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
+                            const int8_t * qv_glob, int64_t n_rows_pad, int64_t r_glob, int64_t kblk);
+
+// One-shot, all threads: scatter the whole src1 tensor's q8 codes into the flat
+// [slab][k/4-in-slab][row][4] region (one code byte per element, rows padded to
+// 16 and zeroed past n_rows). d and bsums stay in the natural layout. Each call
+// covers rows [r_start, r_end) (16-aligned, may reach n_rows_pad), so callers
+// split the tensor into row groups per thread
+void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
+                                int64_t r_start, int64_t r_end,
+                                int64_t n_k, int64_t n_rows, int64_t n_rows_pad, int8_t * qv_glob);
 
 // tag-dispatched unpack: rows is the base of one (window, k-block), cast to the format's block type
 inline void tiled_unpack_src0(tiled_fmt_q4_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {

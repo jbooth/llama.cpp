@@ -89,6 +89,67 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     return true;
 }
 
+// One-shot, all-threads preparation of the src1 interleave region (layout in
+// tiled_interleave_src1_q8_K): the q8 codes of the whole tensor are scattered
+// into a flat [slab][k/4-in-slab][row][4] wdata region (rows padded to 16,
+// zeroed tail) so the per (window, slab) unpack becomes a contiguous copy.
+// The 16-row group partition spans all threads; the F32 to q8_K conversion
+// (split by k-block) must finish before any thread interleaves (split by row),
+// hence the inner barrier. No-op on non-VNNI builds: the base is null and the
+// unpack falls back to the per-call gather.
+struct tiled_src1_interleave {
+    const int8_t * qv;    // interleave region base, null when not built
+    int64_t r1_pad;       // row count padded to 16 (0 when not built)
+};
+
+static tiled_src1_interleave tiled_prepare_src1_interleave(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src1,
+        enum ggml_type vec_dot_type,
+        int64_t ne10,
+        int64_t r1,
+        int ith,
+        int nth) {
+    tiled_src1_interleave res = { nullptr, 0 };
+#if !defined(__AVX512VNNI__) || !defined(__AVX512VL__) || !defined(__AVX512DQ__)
+    (void) params;
+    (void) src1;
+    (void) vec_dot_type;
+    (void) ne10;
+    (void) r1;
+    (void) ith;
+    (void) nth;
+    return res;
+#endif
+    res.r1_pad = (r1 + 15) & ~15LL;
+    const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
+    int8_t * qv;
+    const block_q8_K * src1_codes;
+    int64_t row_stride1;
+    if (src1->type != vec_dot_type) {
+        ggml_barrier(params->threadpool);
+        const size_t off = ggml_row_size(vec_dot_type, ne10) * (size_t) r1;
+        GGML_ASSERT(params->wsize >= off + (size_t) k1_pad * res.r1_pad);
+        qv = (int8_t *) ((char *) params->wdata + off);
+        src1_codes = (const block_q8_K *) params->wdata;
+        row_stride1 = ne10 / 256; // wdata rows are contiguous 256 blocks
+    } else {
+        GGML_ASSERT(params->wsize >= (size_t) k1_pad * res.r1_pad);
+        qv = (int8_t *) params->wdata;
+        src1_codes = (const block_q8_K *) src1->data;
+        row_stride1 = src1->nb[1] / sizeof(block_q8_K);
+    }
+    const int64_t n_groups = res.r1_pad / 16;
+    const int64_t g0 = (int64_t) ith * n_groups / nth;
+    const int64_t g1 = (int64_t) (ith + 1) * n_groups / nth;
+    for (int64_t g = g0; g < g1; g++) {
+        tiled_interleave_src1_q8_K(src1_codes + g * 16 * row_stride1, row_stride1,
+                                   g * 16, (g + 1) * 16, k1_pad, r1, res.r1_pad, qv);
+    }
+    res.qv = qv;
+    return res;
+}
+
 template <typename Fmt>
 static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const struct ggml_compute_params * params,
@@ -96,7 +157,8 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     const int64_t ir0_start,
     const int64_t ir0_end,
     const int64_t ir1_start,
-    const int64_t ir1_end) {
+    const int64_t ir1_end,
+    const tiled_src1_interleave & src1_inter) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -130,6 +192,9 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
     }
 
     const size_t ldc = nb1 / nb0;
+
+    const int8_t * qv_glob = src1_inter.qv;
+    const int64_t r1_pad = src1_inter.r1_pad;
 
     TiledSrc0<Fmt> & ah = tiled_src0_holder<Fmt>();
     if (!ah.p) {
@@ -205,7 +270,9 @@ static void ggml_compute_forward_mul_mat_one_chunk_tiled_new(
             for (int64_t ib = 0; ib < ne00; ib += TILE) {
                 const int kblk = (int) (ib / TILE);
                 tiled_unpack_src0(Fmt(), src0_rows + kblk * src0_bs, src0_stride, n_src0, ah.p);
-                tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_src1, tiled_ws.src1);
+                // tile_n1 is the flattened global row index of the window's first row
+                tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_src1, tiled_ws.src1,
+                                       qv_glob, r1_pad, tile_n1, kblk);
 
                 for (int64_t iir0 = tile_n0; iir0 < tile_n0_end; iir0 += MICRO) {
                     for (int64_t iir1 = tile_n1; iir1 < tile_n1_end; iir1 += MICRO) {
@@ -295,6 +362,10 @@ static void ggml_compute_forward_mul_mat_tiled_new(
         }
     }
 
+    // interleave the whole tensor's src1 codes once; no-op on non-VNNI builds
+    const tiled_src1_interleave src1_inter = tiled_prepare_src1_interleave(
+        params, src1, vec_dot_type, ne10, ne11 * ne12 * ne13, ith, nth);
+
     if (ith == 0) {
         // result is accumulated with += below, so it must start at zero
         memset(dst->data, 0, nb0 * ne0 * ne1 * ne2 * ne3);
@@ -352,7 +423,8 @@ static void ggml_compute_forward_mul_mat_tiled_new(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk_tiled_new<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk_tiled_new<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end,
+                                                              src1_inter);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
