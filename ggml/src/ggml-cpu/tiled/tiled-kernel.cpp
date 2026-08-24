@@ -279,8 +279,8 @@ void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
 void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
                             const int8_t * qv_glob, int64_t n_rows_pad, int64_t r_glob, int64_t kblk) {
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
-    const int n_qv = TILED_TILE_K / 4;
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    const int n_qv = TILED_TILE_K / 4;
     // The VNNI body reads only qv, never q, so on this build we build qv alone.
     if (qv_glob) {
         // the tensor was interleaved once (tiled_interleave_src1_q8_K): the tile
@@ -324,21 +324,14 @@ void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_r
         }
     }
 #if !defined(__AVX512VNNI__) || !defined(__AVX512VL__) || !defined(__AVX512DQ__)
-    // non-VNNI build: the scalar/AVX2 bodies read q ([row][k]); qv is not built
+    // non-VNNI build: the scalar/AVX2 bodies read q ([row][k]); qv is a union
+    // alias of q and must not be written (it would clobber q)
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & x = rows[r * row_stride];
             memcpy(&tile->q[r * TILED_TILE_K], x.qs, TILED_TILE_K);
-            // VNNI interleaved copy: [k/4][row][4], a 32B-aligned row-tile load per k/4 group
-            const int8_t * qs = x.qs;
-            for (int g = 0; g < n_qv; g++) {
-                memcpy(&tile->qv[g * TILED_TILE_ROWS * 4 + r * 4], qs + g * 4, 4);
-            }
         } else {
             memset(&tile->q[r * TILED_TILE_K], 0, TILED_TILE_K);
-            for (int g = 0; g < n_qv; g++) {
-                memset(&tile->qv[g * TILED_TILE_ROWS * 4 + r * 4], 0, 4);
-            }
         }
     }
 #endif
@@ -708,11 +701,12 @@ static void tiled_run_microtile_vnni_int(const T & src0, const tiled_tile_src1 &
 // partial sums (two k products each) of ONE (src0-row, src1-col) pair, and
 // the per-pair accumulator cannot extend across src0 rows. The j window
 // is therefore processed in groups of GROUP columns: one i32
-// accumulator per column, live across the subblock loop; GROUP = 4
-// fits the 16 YMM budget (the accs + the a/b/sc/p16 operands). The src0
-// subblock codes are loaded once per (i, s, group) and reused over the
-// group: 1/4 of the src0-side load traffic of a pure per-pair loop. The
-// 16x16 microtile only fixes the buf layout.
+// accumulator per column, live across the subblock loop. GROUP = 8 gives
+// 8 independent dot chains per (i, subblock) to hide the maddubs
+// latency (the VNNI NA=8 analog); a few of the 8 accs spill to stack at
+// the 16 YMM limit. The src0 subblock codes are loaded once per
+// (i, s, group) and reused over the group (1/8 of a pure per-pair loop's
+// src0-side load traffic). The 16x16 microtile only fixes the buf layout.
 //
 // SUBBLK=32: one 256-bit maddubs per (s, column), a 256-bit set1 scale,
 // one 8-lane i32 accumulator per column.
@@ -726,7 +720,7 @@ static void tiled_run_microtile_vnni_int(const T & src0, const tiled_tile_src1 &
 // Math: the same int split-pass as the VNNI kernel. Per (i, j) the
 // accumulators hold sc*raw over the subblocks, so the -> scalar reduce
 // happens ONCE per pair (in the group epilogue). The per-subblock BIAS
-// and mn corrections run as 128-bit i32 vectors, one lane per src1 column,
+// and mn corrections run as 256-bit i32 vectors, one lane per src1 column,
 // with bs from the per-16 bsum table (v2.8: these were scalar per
 // column and dominated the SUBBLK=16 body). S1 = hsum(acc) - BIAS*sum
 // (sc*bs), S2 = sum(mn*bs); the epilogue is scalar: buf += d1 * (d0*S1
@@ -740,7 +734,7 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
     constexpr int SUBBLK = TILED_TILE_K / NB;
     constexpr bool HAS_MIN = T::HAS_MIN_V;
     constexpr int BIAS = T::BIAS_V;
-    constexpr int GROUP = 4; // src1 columns per group: one acc32 per column
+    constexpr int GROUP = 8; // src1 columns per group: one acc32 per column
 
     static_assert(SUBBLK == 16 || SUBBLK == 32, "unsupported SUBBLK");
 
@@ -760,8 +754,8 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
 
         for (int g = 0; g < TILED_MICRO; g += GROUP) {
             const int8_t * q1g[GROUP];
-            __m128i corr = _mm_setzero_si128(); // -BIAS * sum_s sc_s * bs_s, 1 lane per col (vanishes via constexpr)
-            __m128i S2 = _mm_setzero_si128();   // sum_s mn_s * bs_s
+            __m256i corr = _mm256_setzero_si256(); // -BIAS * sum_s sc_s * bs_s, 1 lane per col (vanishes via constexpr)
+            __m256i S2 = _mm256_setzero_si256();   // sum_s mn_s * bs_s
             if constexpr (SUBBLK == 32) {
                 __m256i acc[GROUP];
                 for (int t = 0; t < GROUP; t++) {
@@ -774,26 +768,26 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
                     const __m256i sc16 = _mm256_set1_epi16(sc_row[s]);
                     const int16_t * bs0 = &src1.bsums[s * 2 * TILED_TILE_ROWS + j0 + g];
                     const int16_t * bs1 = &src1.bsums[(s * 2 + 1) * TILED_TILE_ROWS + j0 + g];
-                    // per-col bs as a 4-lane i32 vector: one 8-byte load per bsum row (NS=2)
-                    const __m128i bsv = _mm_add_epi32(
-                        _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *) bs0)),
-                        _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *) bs1)));
+                    // per-col bs as an 8-lane i32 vector: one 16-byte load per bsum row (NS=2)
+                    const __m256i bsv = _mm256_add_epi32(
+                        _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs0)),
+                        _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs1)));
                     for (int t = 0; t < GROUP; t++) {
                         acc[t] = _mm256_add_epi32(acc[t],
                             _mm256_madd_epi16(sc16, _mm256_maddubs_epi16(
                                 q0_32, _mm256_loadu_si256((const __m256i *) &q1g[t][s * SUBBLK]))));
                     }
                     if constexpr (BIAS != 0)
-                        corr = _mm_sub_epi32(corr, _mm_mullo_epi32(bsv, _mm_set1_epi32(BIAS * sc_row[s])));
+                        corr = _mm256_sub_epi32(corr, _mm256_mullo_epi32(bsv, _mm256_set1_epi32(BIAS * sc_row[s])));
                     if constexpr (HAS_MIN)
-                        S2 = _mm_add_epi32(S2, _mm_mullo_epi32(bsv, _mm_set1_epi32(mn_row[s])));
+                        S2 = _mm256_add_epi32(S2, _mm256_mullo_epi32(bsv, _mm256_set1_epi32(mn_row[s])));
                 }
-                int32_t corr_s[GROUP] = { 0, 0, 0, 0 };
-                int32_t S2_s[GROUP] = { 0, 0, 0, 0 };
+                int32_t corr_s[GROUP] = { 0 };
+                int32_t S2_s[GROUP] = { 0 };
                 if constexpr (BIAS != 0)
-                    _mm_storeu_si128((__m128i *) corr_s, corr);
+                    _mm256_storeu_si256((__m256i *) corr_s, corr);
                 if constexpr (HAS_MIN)
-                    _mm_storeu_si128((__m128i *) S2_s, S2);
+                    _mm256_storeu_si256((__m256i *) S2_s, S2);
                 for (int t = 0; t < GROUP; t++) {
                     // 8 i32 lanes -> scalar (the per-pair dot, pre-correction)
                     const __m128i lo = _mm256_castsi256_si128(acc[t]);
@@ -819,8 +813,8 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
                     const __m256i scv = _mm256_set_m128i(_mm_set1_epi16(sc_row[sp + 1]), _mm_set1_epi16(sc_row[sp]));
                     const int16_t * bs0 = &src1.bsums[sp * TILED_TILE_ROWS + j0 + g];
                     const int16_t * bs1 = &src1.bsums[(sp + 1) * TILED_TILE_ROWS + j0 + g];
-                    const __m128i bs0v = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *) bs0));
-                    const __m128i bs1v = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *) bs1));
+                    const __m256i bs0v = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs0));
+                    const __m256i bs1v = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs1));
                     for (int t = 0; t < GROUP; t++) {
                         acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(
                             scv, _mm256_maddubs_epi16(
@@ -828,20 +822,20 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
                     }
                     // per-subblock scales differ, so corr/S2 keep the bs0/bs1 split
                     if constexpr (BIAS != 0)
-                        corr = _mm_sub_epi32(corr, _mm_add_epi32(
-                            _mm_mullo_epi32(bs0v, _mm_set1_epi32(BIAS * sc_row[sp])),
-                            _mm_mullo_epi32(bs1v, _mm_set1_epi32(BIAS * sc_row[sp + 1]))));
+                        corr = _mm256_sub_epi32(corr, _mm256_add_epi32(
+                            _mm256_mullo_epi32(bs0v, _mm256_set1_epi32(BIAS * sc_row[sp])),
+                            _mm256_mullo_epi32(bs1v, _mm256_set1_epi32(BIAS * sc_row[sp + 1]))));
                     if constexpr (HAS_MIN)
-                        S2 = _mm_add_epi32(S2, _mm_add_epi32(
-                            _mm_mullo_epi32(bs0v, _mm_set1_epi32(mn_row[sp])),
-                            _mm_mullo_epi32(bs1v, _mm_set1_epi32(mn_row[sp + 1]))));
+                        S2 = _mm256_add_epi32(S2, _mm256_add_epi32(
+                            _mm256_mullo_epi32(bs0v, _mm256_set1_epi32(mn_row[sp])),
+                            _mm256_mullo_epi32(bs1v, _mm256_set1_epi32(mn_row[sp + 1]))));
                 }
-                int32_t corr_s[GROUP] = { 0, 0, 0, 0 };
-                int32_t S2_s[GROUP] = { 0, 0, 0, 0 };
+                int32_t corr_s[GROUP] = { 0 };
+                int32_t S2_s[GROUP] = { 0 };
                 if constexpr (BIAS != 0)
-                    _mm_storeu_si128((__m128i *) corr_s, corr);
+                    _mm256_storeu_si256((__m256i *) corr_s, corr);
                 if constexpr (HAS_MIN)
-                    _mm_storeu_si128((__m128i *) S2_s, S2);
+                    _mm256_storeu_si256((__m256i *) S2_s, S2);
                 for (int t = 0; t < GROUP; t++) {
                     // 8 i32 lanes -> scalar (the per-pair dot, pre-correction)
                     const __m128i lo = _mm256_castsi256_si128(acc[t]);
@@ -867,8 +861,11 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
 // are AVX2), so each op covers one per-16 group: 16B loads, 8 i16
 // partials, and a 4-lane i32 accumulator. Same group-of-4 structure as
 // the AVX2 kernel (one 4-lane acc per src1 column across the subblock
-// loop, src0 codes hoisted per group); the register budget is looser
-// here, so GROUP = 4 is kept for code uniformity.
+// loop, src0 codes hoisted per group). GROUP = 8 (the AVX2 6.2 change)
+// was tried here and rejected: the 128-bit dot is maddubs + madd_epi16
+// per 16-k chunk (NS = 2 chunks for SUBBLK = 32), so 8 accs plus the dot
+// temps spill 7 of the 8 accs to stack, regressing every format by 6-19%
+// (4096^3). GROUP = 4 keeps all 4 accs in registers.
 
  template <typename T>
 static void tiled_run_microtile_avx(const T & src0, const tiled_tile_src1 & src1,
