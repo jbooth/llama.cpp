@@ -72,8 +72,8 @@ void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_r
         const uint8_t * sc = (const uint8_t *) &utmp[0];
         const uint8_t * mn = (const uint8_t *) &utmp[2];
         for (int s = 0; s < 8; s++) {
-            tile->sc[r * 8 + s] = (int8_t) sc[s];
-            tile->mn[r * 8 + s] = (int8_t) mn[s];
+            tile->sc[r * 8 + s] = (int32_t) sc[s];
+            tile->mn[r * 8 + s] = (int32_t) mn[s];
         }
 
         // extract the 4-bit codes (low 4 + high 4), same extraction as the reference kernels
@@ -103,8 +103,8 @@ void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, int n_r
         const uint8_t * sc = (const uint8_t *) &utmp[0];
         const uint8_t * mn = (const uint8_t *) &utmp[2];
         for (int s = 0; s < 8; s++) {
-            tile->sc[r * 8 + s] = (int8_t) sc[s];
-            tile->mn[r * 8 + s] = (int8_t) mn[s];
+            tile->sc[r * 8 + s] = (int32_t) sc[s];
+            tile->mn[r * 8 + s] = (int32_t) mn[s];
         }
 
         // extract the 5-bit codes (4 low bits + 1 high bit), same extraction as the reference kernels:
@@ -146,7 +146,7 @@ void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_r
         }
 // scale is a plain int8 per 16-element subblock (16 per 256-K)
         for (int s = 0; s < NB; s++)
-            tile->sc[r * NB + s] = (int8_t) x.scales[s];
+            tile->sc[r * NB + s] = (int32_t) (int8_t) x.scales[s];
     }
 }
 
@@ -186,7 +186,7 @@ void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_r
         auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
         const int8_t * scales = (const int8_t *) &auxs[0];
         for (int s = 0; s < NB; s++)
-            tile->sc[r * NB + s] = (int8_t) (scales[s] - 32);
+            tile->sc[r * NB + s] = (int32_t) scales[s] - 32;
     }
 }
 
@@ -211,8 +211,8 @@ void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_r
         }
         // scale/min packed in one byte per 16-element subblock: low 4 bits = scale, high 4 = min
         for (int s = 0; s < NB; s++) {
-            tile->sc[r * NB + s] = (int8_t) (x.scales[s] & 0xF);
-            tile->mn[r * NB + s] = (int8_t) (x.scales[s] >> 4);
+            tile->sc[r * NB + s] = (int32_t) (x.scales[s] & 0xF);
+            tile->mn[r * NB + s] = (int32_t) (x.scales[s] >> 4);
         }
     }
 }
@@ -308,18 +308,17 @@ void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_r
         }
     }
 #endif
-    // d and bsums: natural layout, every build
+    // d and bsums: natural layout, every build; bsums is stored int32 (one 64B vector
+    // load per (s, j0) on VNNI, no per-use cvt on the AVX tiers), plan 12.9
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & x = rows[r * row_stride];
-            for (int s = 0; s < TILED_TILE_K / 16; s++) {
-                tile->bsums[s * TILED_TILE_ROWS + r] = x.bsums[s];
-            }
+            for (int s = 0; s < TILED_TILE_K / 16; s++)
+                tile->bsums[s * TILED_TILE_ROWS + r] = (int32_t) x.bsums[s];
             tile->d[r] = x.d;
         } else {
-            for (int s = 0; s < TILED_TILE_K / 16; s++) {
+            for (int s = 0; s < TILED_TILE_K / 16; s++)
                 tile->bsums[s * TILED_TILE_ROWS + r] = 0;
-            }
             tile->d[r] = 0.0f;
         }
     }
@@ -464,9 +463,10 @@ static void tiled_run_microtile_scalar(const T & src0, const tiled_tile_src1 & s
 // those int accumulators live across the whole 256-K block. The int->
 // float convert and the per-row d0/dmin/d1 application happen once per
 // row at the epilogue. The correction was originally float (cvt +
-// fmadd/fnmadd on the FMA pipe, which also runs dpbusd on Zen 5); the
-// int version measured 3-12% faster and the float one was deleted
-// (plan v2.5, tiled-bench-results.md).
+// fmadd/fnmadd on the FMA pipe); the int version measured 3-12% faster
+// and the float one was deleted (plan v2.5, tiled-bench-results.md).
+// Note: dpbusd was originally believed to run on the FMA pipe; 12.9
+// measured it sharing the 3-port INT pool instead.
 //
 // Microtile shape: 16x16 (matching the driver's microtile window). The band
 // pass below computes NA x 16 (NA = 8 for all formats: acc16 + S1acc = 16
@@ -502,11 +502,9 @@ static void tiled_run_micro_vnni_int_optimized(const T & src0, const tiled_tile_
 
     for (int s = 0; s < NB; s++) {
         // --- 1. Vectorized src1-side block sum calculation ---
-        __m512i bs32 = _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &src1.bsums[s * TILED_TILE_ROWS * NS + j0]));
-        for (int u = 1; u < NS; u++) {
-            const __m256i bsum_16 = _mm256_loadu_si256((const __m256i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0]);
-            bs32 = _mm512_add_epi32(bs32, _mm512_cvtepi16_epi32(bsum_16));
-        }
+        __m512i bs32 = _mm512_loadu_si512((const __m512i *) &src1.bsums[s * TILED_TILE_ROWS * NS + j0]);
+        for (int u = 1; u < NS; u++)
+            bs32 = _mm512_add_epi32(bs32, _mm512_loadu_si512((const __m512i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0]));
 
         __m512i acc16[NA];
         for (int t = 0; t < NA; t++) acc16[t] = _mm512_setzero_si512();
@@ -577,13 +575,15 @@ static void tiled_run_micro_vnni_int_optimized(const T & src0, const tiled_tile_
 // =====================================================================
 //
 // The per-subblock correction is done in int32 instead of float. sc and
-// mn are int8 in the tile, so sc*raw and mn*bs are exact int32 products.
+// mn are int32 in the tile (broadcast from memory, 12.9), so sc*raw and
+// mn*bs are exact int32 products.
 // The per-row floats d0/dmin are applied once at the epilogue instead
 // of once per (row, subblock).
 //
-// The correction runs on the INT pipe (3 ports, no contention with
-// dpbusd, which is on the FMA pipe on Zen 5) instead of the FMA pipe.
-// Per-subblock cost is mullo+padd (2 INT pipe ops, 4 with HAS_MIN).
+// The correction (vpmulld/vpaddd) and dpbusd share the 3-port INT pool
+// on Zen 5 (measured: dpbusd is not on a separate FMA pipe, 12.9), so
+// the correction op count adds to the pool floor. Per-subblock cost is
+// mullo+padd (2 pool ops, 4 with HAS_MIN).
 // Measured 3-12% faster than the float version on the large-K shape;
 // that version and the benchmark switch are deleted (plan v2.5,
 // tiled-bench-results.md).
@@ -615,11 +615,11 @@ static void tiled_run_micro_vnni_int(const T & src0, const tiled_tile_src1 & src
     if constexpr (HAS_MIN)
         for (int t = 0; t < NA; t++) S2acc[t] = _mm512_setzero_si512();
 
+    const int32_t * bsums = src1.bsums; // int32 per-16 sums; NS > 1 combines NS lanes per subblock
     for (int s = 0; s < NB; s++) {
-        __m512i bs32 = _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &src1.bsums[s * TILED_TILE_ROWS * NS + j0]));
-        for (int u = 1; u < NS; u++) {
-            bs32 = _mm512_add_epi32(bs32, _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0])));
-        }
+        __m512i bs32 = _mm512_loadu_si512((const __m512i *) &bsums[s * NS * TILED_TILE_ROWS + j0]);
+        for (int u = 1; u < NS; u++)
+            bs32 = _mm512_add_epi32(bs32, _mm512_loadu_si512((const __m512i *) &bsums[(s * NS + u) * TILED_TILE_ROWS + j0]));
 
         __m512i bias32 = _mm512_setzero_si512();
         if constexpr (BIAS != 0)
@@ -647,20 +647,19 @@ static void tiled_run_micro_vnni_int(const T & src0, const tiled_tile_src1 & src
             if constexpr (BIAS != 0)
                 rawi = _mm512_sub_epi32(rawi, bias32);
             S1acc[t] = _mm512_add_epi32(S1acc[t],
-                _mm512_mullo_epi32(rawi, _mm512_set1_epi32((int) src0.sc[ar * NB + s])));
+                _mm512_mullo_epi32(rawi, _mm512_set1_epi32(src0.sc[ar * NB + s])));
         }
     }
 
     // scratch 12.5: S2 += mn*bs, no dpbusd dependency, kept out of the band pass
     if constexpr (HAS_MIN) {
         for (int s = 0; s < NB; s++) {
-            __m512i bs32 = _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &src1.bsums[s * TILED_TILE_ROWS * NS + j0]));
-            for (int u = 1; u < NS; u++) {
-                bs32 = _mm512_add_epi32(bs32, _mm512_cvtepi16_epi32(_mm256_loadu_si256((const __m256i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0])));
-            }
+            __m512i bs32 = _mm512_loadu_si512((const __m512i *) &bsums[s * NS * TILED_TILE_ROWS + j0]);
+            for (int u = 1; u < NS; u++)
+                bs32 = _mm512_add_epi32(bs32, _mm512_loadu_si512((const __m512i *) &bsums[(s * NS + u) * TILED_TILE_ROWS + j0]));
             for (int t = 0; t < NA; t++) {
                 S2acc[t] = _mm512_add_epi32(S2acc[t],
-                    _mm512_mullo_epi32(bs32, _mm512_set1_epi32((int) src0.mn[(i0 + t) * NB + s])));
+                    _mm512_mullo_epi32(bs32, _mm512_set1_epi32(src0.mn[(i0 + t) * NB + s])));
             }
         }
     }
@@ -749,8 +748,8 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
         const float d0 = src0.d[ar];
         const float dmin0 = src0.dmin[ar];
         const uint8_t * q0 = &src0.q[ar * TILED_TILE_K];
-        const int8_t * sc_row = &src0.sc[ar * NB];
-        const int8_t * mn_row = &src0.mn[ar * NB];
+        const int32_t * sc_row = &src0.sc[ar * NB];
+        const int32_t * mn_row = &src0.mn[ar * NB];
 
         for (int g = 0; g < TILED_MICRO; g += GROUP) {
             const int8_t * q1g[GROUP];
@@ -766,12 +765,9 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
                 for (int s = 0; s < NB; s++) {
                     const __m256i q0_32 = _mm256_loadu_si256((const __m256i *) &q0[s * SUBBLK]);
                     const __m256i sc16 = _mm256_set1_epi16(sc_row[s]);
-                    const int16_t * bs0 = &src1.bsums[s * 2 * TILED_TILE_ROWS + j0 + g];
-                    const int16_t * bs1 = &src1.bsums[(s * 2 + 1) * TILED_TILE_ROWS + j0 + g];
-                    // per-col bs as an 8-lane i32 vector: one 16-byte load per bsum row (NS=2)
                     const __m256i bsv = _mm256_add_epi32(
-                        _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs0)),
-                        _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs1)));
+                        _mm256_loadu_si256((const __m256i *) &src1.bsums[s * 2 * TILED_TILE_ROWS + j0 + g]),
+                        _mm256_loadu_si256((const __m256i *) &src1.bsums[(s * 2 + 1) * TILED_TILE_ROWS + j0 + g]));
                     for (int t = 0; t < GROUP; t++) {
                         acc[t] = _mm256_add_epi32(acc[t],
                             _mm256_madd_epi16(sc16, _mm256_maddubs_epi16(
@@ -811,10 +807,8 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
                 for (int sp = 0; sp < NB; sp += 2) {
                     const __m256i q0_32 = _mm256_loadu_si256((const __m256i *) &q0[sp * SUBBLK]);
                     const __m256i scv = _mm256_set_m128i(_mm_set1_epi16(sc_row[sp + 1]), _mm_set1_epi16(sc_row[sp]));
-                    const int16_t * bs0 = &src1.bsums[sp * TILED_TILE_ROWS + j0 + g];
-                    const int16_t * bs1 = &src1.bsums[(sp + 1) * TILED_TILE_ROWS + j0 + g];
-                    const __m256i bs0v = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs0));
-                    const __m256i bs1v = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) bs1));
+                    const __m256i bs0v = _mm256_loadu_si256((const __m256i *) &src1.bsums[sp * TILED_TILE_ROWS + j0 + g]);
+                    const __m256i bs1v = _mm256_loadu_si256((const __m256i *) &src1.bsums[(sp + 1) * TILED_TILE_ROWS + j0 + g]);
                     for (int t = 0; t < GROUP; t++) {
                         acc[t] = _mm256_add_epi32(acc[t], _mm256_madd_epi16(
                             scv, _mm256_maddubs_epi16(
@@ -882,8 +876,8 @@ static void tiled_run_microtile_avx(const T & src0, const tiled_tile_src1 & src1
         const float d0 = src0.d[ar];
         const float dmin0 = src0.dmin[ar];
         const uint8_t * q0 = &src0.q[ar * TILED_TILE_K];
-        const int8_t * sc_row = &src0.sc[ar * NB];
-        const int8_t * mn_row = &src0.mn[ar * NB];
+        const int32_t * sc_row = &src0.sc[ar * NB];
+        const int32_t * mn_row = &src0.mn[ar * NB];
 
         for (int g = 0; g < TILED_MICRO; g += GROUP) {
             const int8_t * q1g[GROUP];
@@ -900,8 +894,8 @@ static void tiled_run_microtile_avx(const T & src0, const tiled_tile_src1 & src1
                 __m128i bsv = _mm_setzero_si128(); // per-col bs as a 4-lane i32 vector
                 for (int u = 0; u < NS; u++) {
                     const __m128i a16 = _mm_loadu_si128((const __m128i *) &q0[s * SUBBLK + u * 16]);
-                    bsv = _mm_add_epi32(bsv, _mm_cvtepi16_epi32(_mm_loadl_epi64(
-                        (const __m128i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0 + g])));
+                    bsv = _mm_add_epi32(bsv, _mm_loadu_si128(
+                        (const __m128i *) &src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0 + g]));
                     for (int t = 0; t < GROUP; t++) {
                         acc[t] = _mm_add_epi32(acc[t], _mm_madd_epi16(sc16,
                             _mm_maddubs_epi16(a16,

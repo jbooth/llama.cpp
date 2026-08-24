@@ -507,6 +507,7 @@ int main(void) {
     struct { int64_t M, N, K; } shapes[] = {
         { 4096, 4096, 4096 },
         { 4096, 4096,   64 },
+        { 4096, 4096,   1 },
     };
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
         bench_row rows[n_types];

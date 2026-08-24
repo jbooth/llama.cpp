@@ -28,7 +28,10 @@ struct tiled_tile_src1 {
         alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];            // signed q8 codes, natural [row][k]
         alignas(64) int8_t  qv[(TILED_TILE_K / 4) * TILED_TILE_ROWS * 4]; // VNNI interleaved [k/4][row][4]
     };
-    alignas(64) int16_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS]; // s-major per-16 sums, [s][row]
+    // s-major per-16 code sums, [s][row]; int32 (model stores int16): one 64B vector load
+    // per (s, j0) on VNNI, no per-use cvt on the AVX tiers; L2-resident, width costs nothing
+    alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
+    // f32 (not f16): the model stores fp16, the unpack converts once
     float       d[TILED_TILE_ROWS];
 };
 
@@ -38,11 +41,19 @@ struct tiled_tile_src0 {
     static constexpr bool HAS_MIN_V = HAS_MIN; // re-exposed for the kernel templates (which take only the type)
     static constexpr int BIAS_V = BIAS;
     static constexpr int NB = TILED_TILE_K / SUBBLK; // subblocks per 256-K block
+    // one byte per element (4/5/6-bit value in the low bits); unsigned: maddubs/dpbusd take (u8, s8)
     alignas(32) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; // unsigned codes
+    // f32 (not f16): the model stores fp16, the unpack converts once
     float    d[TILED_TILE_ROWS];
     float    dmin[TILED_TILE_ROWS];         // used when HAS_MIN
-    int8_t   sc[TILED_TILE_ROWS * NB];      // per-subblock scale (q3_K: stored as raw-32)
-    int8_t   mn[TILED_TILE_ROWS * NB];      // per-subblock min, used when HAS_MIN
+    // per-subblock side coefficients, one (row, s) pair each, applied per exact integer
+    // subblock dot:  out += d * sc[r][s] * dot(codes)  -  dmin * mn[r][s] * sum(src1 codes)
+    // sc scales the int code dot, mn scales the src1-side code sum (tile->bsums); mn is
+    // only used by HAS_MIN formats (q2/q4/q5_K). q3_K stores sc as (raw 6-bit scale - 32)
+    // (its q1 code offset is handled via BIAS). q6_K uses only sc.
+    // int32 though the values fit int8: broadcast straight from memory, no per-use sign-extend (12.9)
+    int32_t   sc[TILED_TILE_ROWS * NB];      // per-subblock scale (q3_K: stored as raw-32)
+    int32_t   mn[TILED_TILE_ROWS * NB];      // per-subblock min, used when HAS_MIN
     // NB: a BIAS != 0 format needs NO src0-side code sum. sum(src1 codes) with c = u - BIAS
     // = sum(u*src1 code) - BIAS*sum(src1 code): the bias term is BIAS times the src1-side per-subblock
     // bsum (tile_src1->bsums), which the kernel already combines. No src0 sumq is stored.
