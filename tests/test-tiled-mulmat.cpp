@@ -390,20 +390,20 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
 
     printf("\nBENCH %lldx%lld * %lldx%lld, min of 5 timings, 8 threads\n",
            (long long)M, (long long)N, (long long)N, (long long)K);
-    printf("%-8s %10s %12s %12s %11s %11s %15s %15s %15s %15s\n",
+    printf("%-8s %10s %12s %12s %11s %11s %17s %17s %17s %17s\n",
            "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
            "max_err(repack)", "rmse(repack)", "max_err(tiled)", "rmse(tiled)");
     for (size_t i = 0; i < n_types; ++i) {
         const bench_row * r = &rows[i];
         if (r->have_repack) {
-            printf("%-8s %10.3f %12.3f %12.3f %11.2fx %11.2fx %15.6e %15.6e %15.6e %15.6e\n",
+            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %17.5e %17.5e %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    flops / (r->time_repack * 1e12), flops / (r->time_tiled * 1e12),
                    r->time_std / r->time_repack, r->time_std / r->time_tiled,
                    r->max_err_repack, r->rmse_repack, r->max_err_tiled, r->rmse_tiled);
         } else {
-            printf("%-8s %10.3f %12s %12.3f %11s %11.2fx %15s %15s %15.6e %15.6e\n",
+            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %17s %17s %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    "n/a", flops / (r->time_tiled * 1e12), "n/a",

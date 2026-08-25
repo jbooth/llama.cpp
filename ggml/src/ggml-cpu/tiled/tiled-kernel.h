@@ -88,9 +88,10 @@ void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_r
 void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile);
 void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile);
 // src1 unpack: n_rows <= TILED_TILE_ROWS rows, row r at rows + r*row_stride (in blocks).
-// d and bsums always come from the natural q8_K rows; the VNNI build takes the
-// codes from the one-shot interleaved region (qv) when provided, else builds
-// them per call (r_start = global index of the window's first row, kblk = slab)
+// d and bsums always come from the natural q8_K rows; the VNNI build copies
+// the codes from the one-shot interleaved region (qv, non-null on VNNI builds;
+// r_start = global index of the window's first row, kblk = slab), the other
+// builds copy the natural q8 codes per call
 void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
                             const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
 

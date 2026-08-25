@@ -97,8 +97,8 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
 // zeroed tail) so the per (window, slab) unpack becomes a contiguous copy.
 // The 16-row group partition spans all threads; the F32 to q8_K conversion
 // (split by k-block) must finish before any thread interleaves (split by row),
-// hence the inner barrier. No-op on non-VNNI builds: the base is null and the
-// unpack falls back to the per-call gather.
+// hence the inner barrier. No-op on non-VNNI builds: the base is null and
+// the unpack copies the natural q8 codes per call.
 struct tiled_src1_interleave {
     const int8_t * qv;    // interleave region base, null when not built
     int64_t nr1_pad;      // row count padded to 16 (0 when not built)
