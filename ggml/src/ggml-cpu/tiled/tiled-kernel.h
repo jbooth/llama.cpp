@@ -1,6 +1,7 @@
 #pragma once
 
-// Tiled matmul kernel: tile structs, unpackers, microtile kernel.
+// Tiled matmul kernel API: tile structs, format tags, per-ISA microtile kernel
+// entry points, and the arch-specific src1 code unpack op (VNNI).
 // C++ for the per-format template config (SUBBLK, HAS_MIN, BIAS); C-style code otherwise.
 // K-quant weights x q8_K activations; per-ISA branches in the kernel (scalar,
 // AVX, AVX2, AVX512-VNNI).
@@ -10,16 +11,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Defined when this arch's kernel reads the src1 tile codes in a non-natural
+// order (x86 VNNI: [k/4][row][4], fed from the up-front interleaved region).
+// The kernel then provides tiled_unpack_src1_q8_K_kernel, which the driver's
+// src1 unpack calls instead of its generic per-row memcpy
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+#define KERNEL_SRC1_UNPACK 1
+#endif
+
 #define TILED_TILE_K    256 // one QK_K block
 #define TILED_TILE_ROWS 256 // max window rows, ragged at edges
 #define TILED_MICRO     16  // microtile edge (also the bsums code-sum granularity)
 
 // src1 tile: built from q8_K (wdata), shared by all src0 formats.
 struct tiled_tile_src1 {
-    union {
-        alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];            // signed q8 codes, natural [row][k]
-        alignas(64) int8_t  qv[(TILED_TILE_K / 4) * TILED_TILE_ROWS * 4]; // VNNI interleaved [k/4][row][4]
-    };
+    // signed q8 codes, 256 x 256, 64B aligned. The compiled kernel -- not the
+    // unpack -- chooses the byte order: natural [row][k] on the scalar/AVX/AVX2
+    // tiers, [k/4][row][4] on VNNI (one 64B dpbusd vector per k-group x 16 rows).
+    alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];
     // s-major per-16 code sums, [s][row]; int32 (model stores int16): one 64B vector load
     // per (s, j0) on VNNI, no per-use cvt on the AVX tiers; L2-resident, width costs nothing
     alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
@@ -80,46 +89,33 @@ template <> struct tiled_fmt_tile<tiled_fmt_q6_K> { using type = tiled_tile_src0
 template <> struct tiled_fmt_tile<tiled_fmt_q3_K> { using type = tiled_tile_src0_q3_K; };
 template <> struct tiled_fmt_tile<tiled_fmt_q2_K> { using type = tiled_tile_src0_q2_K; };
 
-// unpack one (window, k-block) into a tile: n_rows <= TILED_TILE_ROWS rows,
-// row r at rows + r*row_stride (in blocks)
-void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile);
-void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q5_K * tile);
-void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile);
-void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile);
-void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile);
-// src1 unpack: n_rows <= TILED_TILE_ROWS rows, row r at rows + r*row_stride (in blocks).
-// d and bsums always come from the natural q8_K rows; the VNNI build copies
-// the codes from the one-shot interleaved region (qv, non-null on VNNI builds;
-// r_start = global index of the window's first row, kblk = slab), the other
-// builds copy the natural q8 codes per call
-void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
-                            const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
+// VNNI-only (KERNEL_SRC1_UNPACK): the dpbusd kernel reads the src1 tile codes
+// in the [k/4][row][4] order, so the driver's generic per-row memcpy cannot
+// fill the tile; this op does, from the up-front interleaved region (qv,
+// non-null; r_start = global index of the window's first row, kblk = slab).
+// d and bsums are still filled by the driver's unpack
+#if defined(KERNEL_SRC1_UNPACK)
+void tiled_unpack_src1_q8_K_kernel(int n_rows, tiled_tile_src1 * tile,
+                                   const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
+#endif
 
-// One-shot, all threads: scatter the whole src1 tensor's q8 codes into the flat
-// [slab][k/4-in-slab][row][4] region (one code byte per element, rows padded to
-// 16 and zeroed past nr1). d and bsums stay in the natural layout. Each call
-// covers rows [r_start, r_end) (16-aligned, may reach nr1_pad), so callers
-// split the tensor into row groups per thread
-void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
-                                int64_t r_start, int64_t r_end,
-                                int64_t n_k, int64_t nr1, int64_t nr1_pad, int8_t * qv);
+// info for the src1 interleave region built by tiled_prepare_src1_interleave:
+// qv = base of the up-front [slab][k/4][row][4] code region (null when not
+// built, i.e. non-VNNI), nr1_pad = the region's row count padded to 16 (0 then)
+struct tiled_src1_interleave {
+    const int8_t * qv;
+    int64_t       nr1_pad;
+};
 
-// tag-dispatched unpack: rows is the base of one (window, k-block), cast to the format's block type
-inline void tiled_unpack_src0(tiled_fmt_q4_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
-    tiled_unpack_src0_q4_K((const block_q4_K *) rows, row_stride, n_rows, tile);
-}
-inline void tiled_unpack_src0(tiled_fmt_q5_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q5_K * tile) {
-    tiled_unpack_src0_q5_K((const block_q5_K *) rows, row_stride, n_rows, tile);
-}
-inline void tiled_unpack_src0(tiled_fmt_q6_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile) {
-    tiled_unpack_src0_q6_K((const block_q6_K *) rows, row_stride, n_rows, tile);
-}
-inline void tiled_unpack_src0(tiled_fmt_q3_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile) {
-    tiled_unpack_src0_q3_K((const block_q3_K *) rows, row_stride, n_rows, tile);
-}
-inline void tiled_unpack_src0(tiled_fmt_q2_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile) {
-    tiled_unpack_src0_q2_K((const block_q2_K *) rows, row_stride, n_rows, tile);
-}
+// one-shot, all-threads build of the src1 interleave region: partitions the
+// tiled_interleave_src1_q8_K scatter across threads, sizes/locates the wdata
+// region, and barriers the F32->q8 conversion first. No-op on non-VNNI (returns
+// {nullptr, 0}); the driver always calls it
+struct ggml_compute_params;
+tiled_src1_interleave tiled_prepare_src1_interleave(const struct ggml_compute_params * params,
+                                                    const struct ggml_tensor * src1,
+                                                    enum ggml_type vec_dot_type,
+                                                    int64_t ne10, int64_t nr1, int ith, int nth);
 
 // Accumulate one 16x16 microtile (src0 rows [i0, i0+16), src1 cols [j0, j0+16))
 // over the full 256-K slab held in the tiles into a j-major float buffer

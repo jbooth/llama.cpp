@@ -1,7 +1,9 @@
-// Tiled matmul microtile kernel: K-quant weights x q8_K activations.
+// Tiled matmul kernel: K-quant weights x q8_K activations.
+// Per-ISA microtile branches: AVX512-VNNI (dpbusd), AVX2/AVX (maddubs,
+// reference vec_dot style), scalar (SSE-only builds). The VNNI build also
+// carries the src1 code interleave/unpack: the dpbusd kernel reads the src1
+// codes in [k/4][row][4], so the driver's generic src1 unpack delegates to it.
 // Templated on the src0 tile config (identical for q4_K/q5_K).
-// Per-ISA branches: AVX512-VNNI (dpbusd), AVX2/AVX (maddubs, reference
-// vec_dot style), scalar (SSE-only builds).
 
 #include "tiled-kernel.h"
 #include "ggml-cpu-impl.h"
@@ -17,222 +19,7 @@ static constexpr int TILED_Q8_K_WORDS = sizeof(block_q8_K) / 4;
 static_assert(sizeof(block_q8_K) == 292 && offsetof(block_q8_K, qs) == 4,
               "block_q8_K layout changed, fix the src1 gather indices");
 
-// 32-byte-unit unpack primitives shared by the src0-format code expansion. All codes are
-// bitfields with no overlap, so merging a flag into an already-extracted code uses OR
-// (identical to ADD, matches the reference kernels' semantics).
-#if defined(__AVX2__)
-// packed 4-bit codes -> low nibbles (lo) + high nibbles (hi)
-static inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
-    const __m256i v = _mm256_loadu_si256((const __m256i *) src);
-    // mask before the lane shift so bits do not cross byte boundaries
-    _mm256_storeu_si256((__m256i *) lo, _mm256_and_si256(v, _mm256_set1_epi8(0x0F)));
-    _mm256_storeu_si256((__m256i *) hi, _mm256_srli_epi32(_mm256_and_si256(v, _mm256_set1_epi8(0xF0)), 4));
-}
-// 2-bit values at bit offset S
-template <int S> static inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
-    _mm256_storeu_si256((__m256i *) dst, _mm256_and_si256(
-        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8(0x03)));
-}
-// OR the M-bit value at bit offset S of src into bit offset D of dst
-template <int S, int D, int M>
-static inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
-    const __m256i v = _mm256_slli_epi32(_mm256_and_si256(
-        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8((uint8_t) M)), D);
-    _mm256_storeu_si256((__m256i *) dst, _mm256_or_si256(_mm256_loadu_si256((const __m256i *) dst), v));
-}
-#else
-static inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
-    for (int l = 0; l < 32; l++) { lo[l] = (uint8_t) (src[l] & 0xF); hi[l] = (uint8_t) (src[l] >> 4); }
-}
-template <int S>
-static inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
-    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) ((src[l] >> S) & 3); }
-}
-template <int S, int D, int M>
-static inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
-    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) (dst[l] | (((src[l] >> S) & M) << D)); }
-}
-#endif
-
-void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
-    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q4_K::NB;
-    // 12-byte packed scale/min decode, same extraction as the reference kernels
-    static const uint32_t kmask1 = 0x3f3f3f3f;
-    static const uint32_t kmask2 = 0x0f0f0f0f;
-    static const uint32_t kmask3 = 0x03030303;
-
-    for (int r = 0; r < n_rows; r++) {
-        const block_q4_K & x = rows[r * row_stride];
-
-        tile->d[r]    = ggml_fp16_to_fp32(x.d);
-        tile->dmin[r] = ggml_fp16_to_fp32(x.dmin);
-
-        uint32_t utmp[4];
-        memcpy(utmp, x.scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-
-        const uint8_t * scales = (const uint8_t *) &utmp[0];
-        const uint8_t * mins = (const uint8_t *) &utmp[2];
-        for (int s = 0; s < NB; s++) {
-            tile->scales[r * NB + s] = (int32_t) scales[s];
-            tile->mins[r * NB + s] = (int32_t) mins[s];
-        }
-
-        // extract the 4-bit codes (low 4 + high 4), same extraction as the reference kernels
-        uint8_t * q = &tile->q[r * TILED_TILE_K];
-        tiled_unpk_nib4(x.qs + 0,  q + 0,   q + 32);
-        tiled_unpk_nib4(x.qs + 32, q + 64,  q + 96);
-        tiled_unpk_nib4(x.qs + 64, q + 128, q + 160);
-        tiled_unpk_nib4(x.qs + 96, q + 192, q + 224);
-    }
-}
-
-void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q5_K * tile) {
-    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q5_K::NB;
-    // 12-byte packed scale/min decode, same extraction as the reference kernels
-    static const uint32_t kmask1 = 0x3f3f3f3f;
-    static const uint32_t kmask2 = 0x0f0f0f0f;
-    static const uint32_t kmask3 = 0x03030303;
-
-    for (int r = 0; r < n_rows; r++) {
-        const block_q5_K & x = rows[r * row_stride];
-
-        tile->d[r]    = ggml_fp16_to_fp32(x.d);
-        tile->dmin[r] = ggml_fp16_to_fp32(x.dmin);
-
-        uint32_t utmp[4];
-        memcpy(utmp, x.scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-
-        const uint8_t * scales = (const uint8_t *) &utmp[0];
-        const uint8_t * mins = (const uint8_t *) &utmp[2];
-        for (int s = 0; s < NB; s++) {
-            tile->scales[r * NB + s] = (int32_t) scales[s];
-            tile->mins[r * NB + s] = (int32_t) mins[s];
-        }
-
-        // extract the 5-bit codes (4 low bits + 1 high bit), same as the generic kernels:
-        // 64-element chunk j uses qh bits 2j (low 32) and 2j+1 (high 32); OR adds the 5th bit
-        // (no overlap with the 4-bit codes, identical to the reference ADD)
-        uint8_t * q = &tile->q[r * TILED_TILE_K];
-        tiled_unpk_nib4(x.qs + 0,  q + 0,   q + 32);
-        tiled_unpk_nib4(x.qs + 32, q + 64,  q + 96);
-        tiled_unpk_nib4(x.qs + 64, q + 128, q + 160);
-        tiled_unpk_nib4(x.qs + 96, q + 192, q + 224);
-        tiled_unpk_or<0, 4, 1>(q + 0,   x.qh);
-        tiled_unpk_or<1, 4, 1>(q + 32,  x.qh);
-        tiled_unpk_or<2, 4, 1>(q + 64,  x.qh);
-        tiled_unpk_or<3, 4, 1>(q + 96,  x.qh);
-        tiled_unpk_or<4, 4, 1>(q + 128, x.qh);
-        tiled_unpk_or<5, 4, 1>(q + 160, x.qh);
-        tiled_unpk_or<6, 4, 1>(q + 192, x.qh);
-        tiled_unpk_or<7, 4, 1>(q + 224, x.qh);
-    }
-}
-
-void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile) {
-    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q6_K::NB;
-    for (int r = 0; r < n_rows; r++) {
-        const block_q6_K & x = rows[r * row_stride];
-        tile->d[r] = ggml_fp16_to_fp32(x.d);
-
-        // 6-bit code = 4 low bits (ql) | 2 high bits (qh); see ggml_vec_dot_q6_K_q8_K_generic
-        // per half the lanes are [ql lo(0:32)] [ql lo(32:64)] [ql hi(0:32)] [ql hi(32:64)]
-        uint8_t * q = &tile->q[r * TILED_TILE_K];
-        for (int half = 0; half < 2; half++) {
-            uint8_t * out = q + 128 * half;
-            tiled_unpk_nib4(x.ql + 64 * half + 0,  out + 0,  out + 64);
-            tiled_unpk_nib4(x.ql + 64 * half + 32, out + 32, out + 96);
-            tiled_unpk_or<0, 4, 3>(out + 0,  x.qh + 32 * half);
-            tiled_unpk_or<2, 4, 3>(out + 32, x.qh + 32 * half);
-            tiled_unpk_or<4, 4, 3>(out + 64, x.qh + 32 * half);
-            tiled_unpk_or<6, 4, 3>(out + 96, x.qh + 32 * half);
-        }
-// scale is a plain int8 per 16-element subblock (16 per 256-K)
-        for (int s = 0; s < NB; s++) { tile->scales[r * NB + s] = (int32_t) (int8_t) x.scales[s]; }
-    }
-}
-
-void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile) {
-    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q3_K::NB;
-    for (int r = 0; r < n_rows; r++) {
-        const block_q3_K & x = rows[r * row_stride];
-        tile->d[r] = ggml_fp16_to_fp32(x.d);
-
-        // 3-bit code = 2 low bits (qs) | (1 high bit from hmask << 2)
-        // element e (0..255): half=e>>7, el=e&127, group=el>>5, l=el&31
-        //   low2 = (qs[half*32 + l] >> 2*group) & 3
-        //   high = (hmask[l] >> (half*4 + group)) & 1
-        // see ggml_vec_dot_q3_K_q8_K_generic
-        uint8_t * q = &tile->q[r * TILED_TILE_K];
-        const uint8_t * s0 = x.qs;
-        const uint8_t * s1 = x.qs + 32;
-        uint8_t * o0 = q;
-        uint8_t * o1 = q + 128;
-        tiled_unpk_2bit<0>(s0, o0);      tiled_unpk_or<0, 2, 1>(o0,      x.hmask);
-        tiled_unpk_2bit<2>(s0, o0 + 32); tiled_unpk_or<1, 2, 1>(o0 + 32, x.hmask);
-        tiled_unpk_2bit<4>(s0, o0 + 64); tiled_unpk_or<2, 2, 1>(o0 + 64, x.hmask);
-        tiled_unpk_2bit<6>(s0, o0 + 96); tiled_unpk_or<3, 2, 1>(o0 + 96, x.hmask);
-        tiled_unpk_2bit<0>(s1, o1);      tiled_unpk_or<4, 2, 1>(o1,      x.hmask);
-        tiled_unpk_2bit<2>(s1, o1 + 32); tiled_unpk_or<5, 2, 1>(o1 + 32, x.hmask);
-        tiled_unpk_2bit<4>(s1, o1 + 64); tiled_unpk_or<6, 2, 1>(o1 + 64, x.hmask);
-        tiled_unpk_2bit<6>(s1, o1 + 96); tiled_unpk_or<7, 2, 1>(o1 + 96, x.hmask);
-        // 6-bit scale decode (same kmask trick as the reference), stored as (scales - 32)
-        static const uint32_t kmask1 = 0x03030303;
-        static const uint32_t kmask2 = 0x0f0f0f0f;
-        uint32_t auxs[4];
-        memcpy(auxs, x.scales, 12);
-        const uint32_t tmp = auxs[2];
-        auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        const int8_t * scales = (const int8_t *) &auxs[0];
-        for (int s = 0; s < NB; s++) { tile->scales[r * NB + s] = (int32_t) scales[s] - 32; }
-    }
-}
-
-void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile) {
-    GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q2_K::NB;
-    for (int r = 0; r < n_rows; r++) {
-        const block_q2_K & x = rows[r * row_stride];
-        tile->d[r]    = ggml_fp16_to_fp32(x.d);
-        tile->dmin[r] = ggml_fp16_to_fp32(x.dmin);
-
-        // 2-bit code: element e -> half=e>>7, el=e&127
-        //   byte = half*32 + (el & 31), shift = 2*(el >> 5)
-        // see ggml_vec_dot_q2_K_q8_K_generic
-        uint8_t * q = &tile->q[r * TILED_TILE_K];
-        for (int half = 0; half < 2; half++) {
-            const uint8_t * s = x.qs + 32 * half;
-            uint8_t * out = q + 128 * half;
-            tiled_unpk_2bit<0>(s, out + 0);
-            tiled_unpk_2bit<2>(s, out + 32);
-            tiled_unpk_2bit<4>(s, out + 64);
-            tiled_unpk_2bit<6>(s, out + 96);
-        }
-        // scale/min packed in one byte per 16-element subblock: low 4 bits = scale, high 4 = min
-        for (int s = 0; s < NB; s++) {
-            tile->scales[r * NB + s] = (int32_t) (x.scales[s] & 0xF);
-            tile->mins[r * NB + s] = (int32_t) (x.scales[s] >> 4);
-        }
-    }
-}
-
-void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
+static void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
                                 int64_t r_start, int64_t r_end,
                                 int64_t n_k, int64_t nr1, int64_t nr1_pad, int8_t * qv) {
     // One-shot scatter of the src1 q8 codes of rows [r_start, r_end) into the
@@ -248,7 +35,7 @@ void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
     // write zeros, so the 16-row padded tail is covered here (no separate
     // memset). One code byte per element; d and bsums stay in the natural
     // rows and are never touched. The [row][4] tail makes the (window,
-    // slab) tile column 4B-contiguous per row, so tiled_unpack_src1_q8_K
+    // slab) tile column 4B-contiguous per row, so tiled_unpack_src1_q8_K_kernel
     // copies it straight into the tile.
     // n_k is the region width in elements (already slab-padded by the
     // caller); the last slab may be partial and its excess groups read the
@@ -308,51 +95,85 @@ void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
     }
 }
 
-void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
-                            const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+// The dpbusd body reads the src1 codes in the [k/4][row][4] order (one 64B
+// vector per k-group x 16 rows), so the driver's generic per-row memcpy
+// cannot fill the tile; this op does (the driver calls it under
+// KERNEL_SRC1_UNPACK). The tensor was interleaved up front by
+// tiled_interleave_src1_q8_K, so the tile column is 4 bytes per row,
+// contiguous. The window's 16-padded span [r_start, r_start + n_padded) can
+// reach past the region's 16-padded row count for a ragged last window, so
+// clamp the copy to the region and zero the tail: those rows are all
+// >= n_rows (dropped at the store) and read the zeroed pad tail either way.
+void tiled_unpack_src1_q8_K_kernel(int n_rows, tiled_tile_src1 * tile,
+                                   const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
     const int n_qv = TILED_TILE_K / 4;
-    // The VNNI body reads only qv, never q, so on this build we build qv alone.
-    // The tensor is interleaved once up front (tiled_interleave_src1_q8_K): the
-    // tile column is 4 bytes per row, contiguous. The window's 16-padded span
-    // [r_start, r_start + n_padded) can reach past the region's 16-padded row
-    // count for a ragged last window, so clamp the copy to the region and zero
-    // the tail: those rows are all >= n_rows (dropped at the store) and read
-    // the zeroed pad tail either way.
     GGML_ASSERT(qv);
     const int n_copy = (int) MIN((int64_t) n_padded, nr1_pad - r_start);
     for (int g = 0; g < n_qv; g++) {
-        memcpy(&tile->qv[g * TILED_TILE_ROWS * 4],
+        memcpy(&tile->q[g * TILED_TILE_ROWS * 4],
                qv + ((int64_t) (kblk * n_qv + g) * nr1_pad + r_start) * 4, (size_t) n_copy * 4);
-        memset(&tile->qv[g * TILED_TILE_ROWS * 4 + (size_t) n_copy * 4], 0, (size_t) (n_padded - n_copy) * 4);
+        memset(&tile->q[g * TILED_TILE_ROWS * 4 + (size_t) n_copy * 4], 0, (size_t) (n_padded - n_copy) * 4);
     }
+}
 #endif
-    // d and bsums: natural layout, every build; bsums is stored int32 (one 64B vector
-    // load per (s, j0) on VNNI, no per-use cvt on the AVX tiers), plan 12.9
-    for (int r = 0; r < n_padded; r++) {
-        if (r < n_rows) {
-            const block_q8_K & x = rows[r * row_stride];
-            for (int s = 0; s < TILED_TILE_K / TILED_MICRO; s++) { tile->bsums[s * TILED_TILE_ROWS + r] = (int32_t) x.bsums[s]; }
-            tile->d[r] = x.d;
-        } else {
-            for (int s = 0; s < TILED_TILE_K / TILED_MICRO; s++) { tile->bsums[s * TILED_TILE_ROWS + r] = 0; }
-            tile->d[r] = 0.0f;
-        }
-    }
+
+// One-shot, all-threads preparation of the src1 interleave region (layout in
+// tiled_interleave_src1_q8_K): the q8 codes of the whole tensor are scattered
+// into a flat [slab][k/4-in-slab][row][4] wdata region (rows padded to 16,
+// zeroed tail) so the per (window, slab) unpack becomes a contiguous copy.
+// The 16-row group partition spans all threads; the F32 to q8_K conversion
+// (split by k-block) must finish before any thread interleaves (split by row),
+// hence the inner barrier. No-op on non-VNNI builds: the base is null and
+// the unpack copies the natural q8 codes per call.
+tiled_src1_interleave tiled_prepare_src1_interleave(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src1,
+        enum ggml_type vec_dot_type,
+        int64_t ne10,
+        int64_t nr1,
+        int ith,
+        int nth) {
+    tiled_src1_interleave res = { nullptr, 0 };
 #if !defined(__AVX512VNNI__) || !defined(__AVX512VL__) || !defined(__AVX512DQ__)
-    // non-VNNI build: the scalar/AVX2 bodies read q ([row][k]); qv is a union
-    // alias of q and must not be written (it would clobber q)
-    for (int r = 0; r < n_padded; r++) {
-        if (r < n_rows) {
-            const block_q8_K & x = rows[r * row_stride];
-            memcpy(&tile->q[r * TILED_TILE_K], x.qs, TILED_TILE_K);
-        } else {
-            memset(&tile->q[r * TILED_TILE_K], 0, TILED_TILE_K);
-        }
-    }
+    (void) params;
+    (void) src1;
+    (void) vec_dot_type;
+    (void) ne10;
+    (void) nr1;
+    (void) ith;
+    (void) nth;
+    return res;
 #endif
+    res.nr1_pad = (nr1 + 15) & ~15LL;
+    const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
+    int8_t * qv;
+    const block_q8_K * src1_codes;
+    int64_t src1_stride;
+    if (src1->type != vec_dot_type) {
+        ggml_barrier(params->threadpool);
+        const size_t off = ggml_row_size(vec_dot_type, ne10) * (size_t) nr1;
+        GGML_ASSERT(params->wsize >= off + (size_t) k1_pad * res.nr1_pad);
+        qv = (int8_t *) ((char *) params->wdata + off);
+        src1_codes = (const block_q8_K *) params->wdata;
+        src1_stride = ne10 / 256; // wdata rows are contiguous 256 blocks
+    } else {
+        GGML_ASSERT(params->wsize >= (size_t) k1_pad * res.nr1_pad);
+        qv = (int8_t *) params->wdata;
+        src1_codes = (const block_q8_K *) src1->data;
+        src1_stride = src1->nb[1] / sizeof(block_q8_K);
+    }
+    const int64_t n_groups = res.nr1_pad / 16;
+    const int64_t g0 = (int64_t) ith * n_groups / nth;
+    const int64_t g1 = (int64_t) (ith + 1) * n_groups / nth;
+    for (int64_t g = g0; g < g1; g++) {
+        tiled_interleave_src1_q8_K(src1_codes + g * 16 * src1_stride, src1_stride,
+                                   g * 16, (g + 1) * 16, k1_pad, nr1, res.nr1_pad, qv);
+    }
+    res.qv = qv;
+    return res;
 }
 
 template <typename T>
@@ -468,11 +289,11 @@ static void tiled_run_micro_vnni_int_8x16(const T & src0, const tiled_tile_src1 
         #pragma GCC unroll 8
         for (int g = 0; g < NG; g++) {
             const int kg = s * NG + g;
-            const __m512i qv = _mm512_loadu_si512((const __m512i *) &src1.qv[kg * TILED_TILE_ROWS * 4 + j0 * 4]);
+            const __m512i codes = _mm512_loadu_si512((const __m512i *) &src1.q[kg * TILED_TILE_ROWS * 4 + j0 * 4]);
             for (int t = 0; t < NUM_ROWS; t++) {
                 const uint32_t u4 = *(const uint32_t *) &src0.q[(i0 + t) * TILED_TILE_K + kg * 4];
                 const __m512i u4b = _mm512_set1_epi32((int) u4);
-                acc16[t] = _mm512_dpbusd_epi32(acc16[t], u4b, qv);
+                acc16[t] = _mm512_dpbusd_epi32(acc16[t], u4b, codes);
             }
         }
 
