@@ -1020,7 +1020,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "L2_NORM",
 
     "MUL_MAT",
-    "MUL_MAT_TILED",
     "MUL_MAT_ID",
     "OUT_PROD",
 
@@ -1101,7 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,7 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3311,23 +3310,6 @@ void ggml_mul_mat_set_hint(
     const int32_t hint_i32 = (int32_t) hint;
 
     ggml_set_op_params_i32(a, 1, hint_i32);
-}
-
-struct ggml_tensor * ggml_mul_mat_tiled(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
-    GGML_ASSERT(ggml_can_mul_mat(a, b));
-    GGML_ASSERT(!ggml_is_transposed(a));
-
-    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    result->op     = GGML_OP_MUL_MAT_TILED;
-    result->src[0] = a;
-    result->src[1] = b;
-
-    return result;
 }
 
 // ggml_mul_mat_id

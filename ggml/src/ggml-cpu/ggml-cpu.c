@@ -1265,6 +1265,12 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    // tiled K-quant path: takes the gated shapes (gate + env switches, see
+    // tiled.cpp), returns false and the stock path runs everything else
+    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1838,10 +1844,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
-        case GGML_OP_MUL_MAT_TILED:
-            {
-                ggml_compute_forward_mul_mat_tiled(params, tensor);
-            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -2334,7 +2336,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_MUL_MAT_TILED:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2863,23 +2864,17 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-                    } break;
-                case GGML_OP_MUL_MAT_TILED:
-                    {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
-
-                        if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
-                        }
+                        if (ggml_tiled_matmul_supported(node->src[0], node->src[1], node)) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-                        // VNNI interleave region: one src1 code byte per element,
-                        // rows padded to 16 (see tiled.cpp)
-                        {
-                            const int64_t r1 = node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
-                            const int64_t k1_pad = (node->src[1]->ne[0] + 255) & ~255LL;
-                            cur += k1_pad * ((r1 + 15) & ~15LL);
-                        }
+                            // VNNI interleave region: one src1 code byte per element,
+                            // rows padded to 16 (see tiled.cpp)
+                            {
+                                const int64_t r1 = node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
+                                const int64_t k1_pad = (node->src[1]->ne[0] + 255) & ~255LL;
+                                cur += k1_pad * ((r1 + 15) & ~15LL);
+                            }
 #endif
+                        }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {

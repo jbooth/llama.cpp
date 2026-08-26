@@ -8,6 +8,7 @@
 #include "tiled-kernel.h"
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <new>
@@ -49,10 +50,53 @@ static tiled_src0_slot<Fmt> & tiled_get_src0_slot() {
     return s;
 }
 
+// process-wide switches, read once per process. The plan and the compute
+// hook both go through the gate below, so one read keeps the wdata
+// reservation and the take decision in sync.
+//
+// GGML_CPU_TILED_MM: master switch, on by default; the gate below then
+// decides take/fallback per op. Setting it to 0 opts out of the feature
+// entirely (no take, no reservation).
+// GGML_CPU_TILED_MM_FORCE: test/bench only; take the tiled path even where
+// the profitability check below rejects. Subordinate to the master switch
+// and never relaxes the hard constraints.
+static bool ggml_tiled_matmul_enabled(void) {
+    static bool enabled = true;
+    static bool inited  = false;
+    if (!inited) {
+        const char * env = getenv("GGML_CPU_TILED_MM");
+        enabled = env == NULL || atoi(env) != 0;
+        inited = true;
+    }
+    return enabled;
+}
+
+static bool ggml_tiled_matmul_forced(void) {
+    static bool forced = false;
+    static bool inited  = false;
+    if (!inited) {
+        const char * env = getenv("GGML_CPU_TILED_MM_FORCE");
+        forced = env != NULL && atoi(env) == 1;
+        inited = true;
+    }
+    return forced;
+}
+
 // shape/type gate; anything not supported here runs the old path
-static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
-                                        const struct ggml_tensor * src1,
-                                        const struct ggml_tensor * dst) {
+bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
+                                 const struct ggml_tensor * src1,
+                                 const struct ggml_tensor * dst) {
+    if (!ggml_tiled_matmul_enabled()) {
+        return false;
+    }
+
+    // hard constraints: the kernel is only correct/defined for these; the
+    // force switch never relaxes them
+    // repack-buffer weights hold a repacked layout, not the raw quants this
+    // path reads; the stock path selects the repack kernel via src0->extra
+    if (src0->extra != NULL) {
+        return false;
+    }
     // K-quant weights only (the gateway switch grows per phase)
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
         src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q2_K) {
@@ -73,15 +117,23 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     if (dst->nb[0] != sizeof(float) || dst->nb[0] > dst->nb[1] || dst->nb[1] > dst->nb[2] || dst->nb[2] > dst->nb[3]) {
         return false;
     }
-    // no broadcast dims in phase 1
+    // src0 batch dims broadcast over src1 batch dims (the kernel maps src0
+    // batch coords down with i02 = i12/r2, i03 = i13/r3, as in the stock path)
     if (src0->ne[2] == 0 || src0->ne[3] == 0 ||
-        src1->ne[2] != src0->ne[2] || src1->ne[3] != src0->ne[3]) {
+        src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
         return false;
     }
     // src1 rows must be addressable as contiguous rows (wdata is contiguous by construction)
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
         return false;
     }
+
+    // the force switch (test/bench only) takes what the profitability
+    // check below would reject
+    if (ggml_tiled_matmul_forced()) {
+        return true;
+    }
+
     // small M (decode): the weight tile unpack is paid once per op and only amortized
     // over M rows; below this the stock vec_dot/GEMV path wins (no row is processed
     // twice, so there is no reuse to offset the unpack)
@@ -241,7 +293,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
         // row offset must use i11 (not the flattened tile_n1, which spans all batch dims)
         const int64_t i11 = tile_n1 - i13 * ne12 * ne11 - i12 * ne11;
 
-        // dst batches == src1 batches (ggml_mul_mat_tiled), so the loop batch
+        // dst batches == src1 batches (ggml_mul_mat), so the loop batch
         // coords are in src1 space; src0 batches are broadcast over them
         // (ne02|ne12, ne03|ne13), map down into src0's own batch for the src0 tile
         const int64_t r2 = ne12 / ne02;
@@ -303,21 +355,7 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-    const size_t nb10  = src1->nb[0];
-
-    const int64_t ne0 = dst->ne[0];
-    const int64_t ne1 = dst->ne[1];
-    const int64_t ne2 = dst->ne[2];
-    const int64_t ne3 = dst->ne[3];
-    const size_t nb0  = dst->nb[0];
-    const size_t nb1  = dst->nb[1];
-    const size_t nb2  = dst->nb[2];
-    const size_t nb3  = dst->nb[3];
+    GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -436,9 +474,16 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
     }
 }
 
-void ggml_compute_forward_mul_mat_tiled(
+bool ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    // the stock path is the reference; --use-ref must stay on it
+    if (params->use_ref) {
+        return false;
+    }
+    if (!ggml_tiled_matmul_supported(dst->src[0], dst->src[1], dst)) {
+        return false;
+    }
     switch (dst->src[0]->type) {
         case GGML_TYPE_Q4_K:
             ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q4_K>(params, dst);
@@ -456,6 +501,7 @@ void ggml_compute_forward_mul_mat_tiled(
             ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q2_K>(params, dst);
             break;
         default:
-            break;
+            return false;
     }
+    return true;
 }

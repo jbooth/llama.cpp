@@ -9,6 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__unix__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+// failed checks; main exits non-zero so CTest sees them
+static int n_failed = 0;
+
 static float * gen_rand_f32(int64_t n) {
     float * data = (float *) malloc(n * sizeof(float));
     for (int64_t i = 0; i < n; ++i) {
@@ -63,6 +71,93 @@ static void fill_tensor(struct ggml_tensor * t, const float * src, int64_t src_r
     free(tmp_f32);
 }
 
+// master switch, "off" direction. The switches are read once per process
+// (tiled.cpp), so this runs in a child where GGML_CPU_TILED_MM=0 and
+// GGML_CPU_TILED_MM_FORCE=1. The shape is rejected by the profitability
+// check (M < 64), so with force on the tiled kernel would run unless the
+// master switch wins: use_ref on/off must be bit-exact
+static int master_off_check(void) {
+    const char * env = getenv("GGML_CPU_TILED_MM");
+    if (env == NULL || atoi(env) != 0) {
+        printf("TEST master-off: FAIL (GGML_CPU_TILED_MM must be 0)\n");
+        return 1;
+    }
+    const int64_t M = 32, N = 1024, K = 1024;
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(backend, 8);
+
+    srand(0x1234);
+    float * src1_data = gen_rand_f32(M * N);
+    float * src0_data = gen_rand_f32(N * K);
+    float * out_ref = (float *) malloc(M * K * sizeof(float));
+    float * out_std = (float *) malloc(M * K * sizeof(float));
+
+    struct ggml_init_params ip = { .mem_size = 1024 * 1024 * 1024, .no_alloc = true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  N, M);
+    struct ggml_tensor * src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, N, K);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_tensor * dst = ggml_mul_mat(ctx, src0, src1);
+    ggml_build_forward_expand(gf, dst);
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    fill_tensor(src1, src1_data, M, N, GGML_TYPE_F32);
+    // src0 is K rows of N in ggml layout
+    float * src0_T = (float *) malloc(N * K * sizeof(float));
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            src0_T[k * N + n] = src0_data[n * K + k];
+        }
+    }
+    fill_tensor(src0, src0_T, K, N, GGML_TYPE_Q4_K);
+
+    ggml_backend_cpu_set_use_ref(backend, true);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, out_ref, 0, ggml_nbytes(dst));
+    ggml_backend_cpu_set_use_ref(backend, false);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, out_std, 0, ggml_nbytes(dst));
+
+    float max_err, rms_err;
+    compare_f32(out_ref, out_std, M * K, &max_err, &rms_err);
+    const bool pass = (max_err == 0.0f);
+    printf("TEST master-off %lldx%lld * %lldx%lld (q4_K): %s (max_err: %f, rms: %f)\n",
+           (long long) M, (long long) N, (long long) N, (long long) K,
+           pass ? "PASS" : "FAIL", max_err, rms_err);
+
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    free(src1_data); free(src0_data); free(src0_T); free(out_ref); free(out_std);
+    return pass ? 0 : 1;
+}
+
+// re-exec self with the master switch off and force on so the child gets a
+// fresh one-shot env read and the check proves master-off beats force;
+// returns the child's success
+#if defined(__unix__)
+static bool run_master_off_check(const char * self) {
+    fflush(stdout); // the child would otherwise inherit the unflushed buffer
+    const pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+    if (pid == 0) {
+        setenv("GGML_CPU_TILED_MM", "0", 1);
+        setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
+        char * args[3] = { (char *) self, (char *) "--master-off-check", NULL };
+        execv(self, args);
+        perror("execv");
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
+
 void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
     srand(0x1234);
 
@@ -89,7 +184,7 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     ggml_build_forward_expand(gf, dst);
 
     struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
-    struct ggml_tensor * dst_t   = ggml_mul_mat_tiled(ctx, src0, src1);
+    struct ggml_tensor * dst_t   = ggml_mul_mat(ctx, src0, src1);
     ggml_build_forward_expand(gf_t, dst_t);
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -108,10 +203,12 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
     }
     fill_tensor(src0, src0_ref_T, K, N, quant_type);
 
+    // reference = stock path (use_ref keeps the op off the tiled hook),
+    // tiled = the gated path; same quantized weights, same graph op
+    ggml_backend_cpu_set_use_ref(backend, true);
     ggml_backend_graph_compute(backend, gf);
+    ggml_backend_cpu_set_use_ref(backend, false);
     ggml_backend_graph_compute(backend, gf_t);
-
-    // dst is (K, M). Result dst_ref is (M, K). Read rows of dst into dst_out.
     for (int64_t i = 0; i < M; ++i) {
         ggml_backend_tensor_get(dst,   dst_out + i*K,   i * dst->nb[1], K * sizeof(float));
         ggml_backend_tensor_get(dst_t, dst_tiled + i*K,   i * dst_t->nb[1], K * sizeof(float));
@@ -147,7 +244,9 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
 
     ggml_free(ctx);
     free(src1_ref); free(src0_ref); free(src0_ref_T); free(dst_out); free(dst_tiled);
-    //if (max_err > tol) { exit(1); }
+    if (max_err > tol) {
+        ++n_failed;
+    }
 }
 
 // Higher-dim (ne[2], ne[3] > 1) bug-for-bug check: tiled vs std.
@@ -191,7 +290,7 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
     ggml_build_forward_expand(gf, dst);
 
     struct ggml_cgraph * gf_t  = ggml_new_graph(ctx);
-    struct ggml_tensor * dst_t   = ggml_mul_mat_tiled(ctx, src0, src1);
+    struct ggml_tensor * dst_t   = ggml_mul_mat(ctx, src0, src1);
     ggml_build_forward_expand(gf_t, dst_t);
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -206,7 +305,10 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
     ggml_backend_tensor_set(src0, src0_q, 0, ggml_nbytes(src0));
     free(src0_q);
 
+    // reference = stock path (use_ref keeps the op off the tiled hook)
+    ggml_backend_cpu_set_use_ref(backend, true);
     ggml_backend_graph_compute(backend, gf);
+    ggml_backend_cpu_set_use_ref(backend, false);
     ggml_backend_graph_compute(backend, gf_t);
 
     ggml_backend_tensor_get(dst,   dst_std,   0, ggml_nbytes(dst));
@@ -223,8 +325,10 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
     compare_f32(dst_std, dst_tiled, n_dst, &max_err, &rms_err);
     float tol = (quant_type == GGML_TYPE_F32) ? 1e-4f : fmaxf(1e-3f, 1e-3f*scale);
 
-    // which path did the tiled op take (mirrors ggml_tiled_matmul_supported)
-    bool tiled_kernel = (N % 256 == 0) && (M >= 64) && (src1_2 == src0_2) && (src1_3 == src0_3);
+    // which path did the tiled op take (mirrors the hard-constraint gate; the
+    // harness runs with force on, so the profitability check is bypassed)
+    bool tiled_kernel = (N % 256 == 0) && (src0_2 > 0) && (src0_3 > 0)
+        && (src1_2 % src0_2 == 0) && (src1_3 % src0_3 == 0);
 
     printf("TEST %lldx%lldx%lldx%lld * %lldx%lldx%lldx%lld (%s, %s): %s (max_err: %f, rms: %f, scale: %f)\n",
            (long long)M, (long long)N, (long long)src1_2, (long long)src1_3,
@@ -246,6 +350,9 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
 
     ggml_free(ctx);
     free(src1_ref); free(src0_ref); free(dst_std); free(dst_tiled);
+    if (max_err > tol) {
+        ++n_failed;
+    }
 }
 
 static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
@@ -296,12 +403,13 @@ struct bench_row {
 };
 
 // One timed run of each path (standard ggml_mul_mat, repacked ggml_mul_mat
-// via the CPU_REPACK buffer, ggml_mul_mat_tiled) on the same quantized
+// via the CPU_REPACK buffer, tiled ggml_mul_mat) on the same quantized
 // weights, plus max error and RMSE vs the standard output. std and tiled
-// share one weight tensor; repack uses a second tensor in the repack buffer
-// (whose set_tensor repacks the raw quants, and whose kernel is selected
-// because the weight lives in that buffer type). The repack column is only
-// available where a repack kernel exists for the type (x86: q4_K, q2_K);
+// share one weight tensor and are the same op now; use_ref selects the
+// stock path for the std timing (the repack kernel is selected because the
+// weight lives in the repack buffer type, and the gate excludes src0->extra,
+// so it is unaffected by use_ref). The repack column is only available where
+// a repack kernel exists for the type (x86: q4_K, q2_K);
 // init_tensor sets src0_rep->extra to the repack layout or NULL.
 static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_type quant_type) {
     bench_row row;
@@ -322,7 +430,7 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     ggml_build_forward_expand(gf_std, dst_std);
 
     struct ggml_cgraph * gf_tiled = ggml_new_graph(ctx);
-    struct ggml_tensor * dst_tiled  = ggml_mul_mat_tiled(ctx, src0_std, src1);
+    struct ggml_tensor * dst_tiled  = ggml_mul_mat(ctx, src0_std, src1);
     ggml_build_forward_expand(gf_tiled, dst_tiled);
 
     struct ggml_cgraph * gf_repack = ggml_new_graph(ctx);
@@ -361,8 +469,11 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
     free(src1_data); free(src0_data); free(src0_T);
 
     // one warmup + N timings per path; best (min) wins
+    // std and tiled are the same op; use_ref selects the stock path
     const int n_reps = 5;
+    ggml_backend_cpu_set_use_ref(backend, true);
     row.time_std    = time_graph_compute_best(backend, gf_std, n_reps);
+    ggml_backend_cpu_set_use_ref(backend, false);
     if (row.have_repack) {
         row.time_repack = time_graph_compute_best(backend, gf_repack, n_reps);
     }
@@ -413,7 +524,20 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
     }
 }
 
-int main(void) {
+int main(int argc, char ** argv) {
+    // master switch, "off" direction: re-exec'd child, runs with
+    // GGML_CPU_TILED_MM=0
+    if (argc > 1 && strcmp(argv[1], "--master-off-check") == 0) {
+        return master_off_check();
+    }
+
+    // this harness exercises the tiled path, including shapes the
+    // profitability gate would reject in production, so the master switch
+    // is forced on and force is set (both are read once, before the first
+    // plan)
+    setenv("GGML_CPU_TILED_MM", "1", 1);
+    setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
+
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, 8);
     test_matmul(backend, 512, 1024, 512, GGML_TYPE_Q6_K);
@@ -495,18 +619,34 @@ int main(void) {
     test_matmul_highdim(backend, 1024, 1024, 1024, 1, 2, 1, 2, GGML_TYPE_Q4_K); // 3D, tiled
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled
     test_matmul_highdim(backend,  512, 1024,  512, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled, smaller
-    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_K); // src1_2>src0_2, fallback
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_K); // broadcast r2=2 (src1_2>src0_2)
+    test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 1, GGML_TYPE_Q4_K); // broadcast r3=2 (src1_3>src0_3)
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q6_K); // 3D, tiled, q6_K
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q3_K); // 4D, tiled, q3_K
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q2_K); // 4D, tiled, q2_K
+
+    // master switch, "off" direction: read once per process, so the check
+    // runs in a re-exec'd child with GGML_CPU_TILED_MM=0 (and force on)
+#if defined(__unix__)
+    if (!run_master_off_check(argv[0])) {
+        printf("TEST master-off: FAIL (re-exec)\n");
+        ++n_failed;
+    }
+#else
+    printf("TEST master-off: SKIP (fork/exec unavailable)\n");
+#endif
 
     // one timing per quant type and shape; the table compares standard,
     // repack and tiled, with max error / RMSE vs the standard output
     const ggml_type bench_types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
     const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
     struct { int64_t M, N, K; } shapes[] = {
+        { 8192, 8192, 8192 },
         { 4096, 4096, 4096 },
         { 4096, 4096,   64 },
+        { 4096, 4096,   32 },
+        { 4096, 4096,   16 },
+        { 4096, 4096,   8 },
         { 4096, 4096,   1 },
     };
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
@@ -518,5 +658,5 @@ int main(void) {
     }
 
     ggml_backend_free(backend);
-    return 0;
+    return n_failed ? 1 : 0;
 }
