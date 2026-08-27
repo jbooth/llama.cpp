@@ -15,10 +15,10 @@
 
 #define UNUSED GGML_UNUSED
 
-// unpack routines for various quant types src0, q8_k src1
-static void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
+// unpack routines for various quant types src0
+static void tiled_unpack_src0(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q4_K::NB;
+    constexpr int NB = 8; // 32-wide subblocks
     // 12-byte packed scale/min decode, same extraction as the reference kernels
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -54,9 +54,9 @@ static void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, 
     }
 }
 
-static void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q5_K * tile) {
+static void tiled_unpack_src0(const block_q5_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q5_K::NB;
+    constexpr int NB = 8; // 32-wide subblocks
     // 12-byte packed scale/min decode, same extraction as the reference kernels
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -102,9 +102,9 @@ static void tiled_unpack_src0_q5_K(const block_q5_K * rows, int64_t row_stride, 
     }
 }
 
-static void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile) {
+static void tiled_unpack_src0(const block_q6_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q6_K::NB;
+    constexpr int NB = 16; // 16-wide subblocks
     for (int r = 0; r < n_rows; r++) {
         const block_q6_K & x = rows[r * row_stride];
         tile->d[r] = ggml_fp16_to_fp32(x.d);
@@ -126,9 +126,9 @@ static void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, 
     }
 }
 
-static void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile) {
+static void tiled_unpack_src0(const block_q3_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q3_K::NB;
+    constexpr int NB = 16; // 16-wide subblocks
     for (int r = 0; r < n_rows; r++) {
         const block_q3_K & x = rows[r * row_stride];
         tile->d[r] = ggml_fp16_to_fp32(x.d);
@@ -166,9 +166,9 @@ static void tiled_unpack_src0_q3_K(const block_q3_K * rows, int64_t row_stride, 
     }
 }
 
-static void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile) {
+static void tiled_unpack_src0(const block_q2_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
-    constexpr int NB = tiled_tile_src0_q2_K::NB;
+    constexpr int NB = 16; // 16-wide subblocks
     for (int r = 0; r < n_rows; r++) {
         const block_q2_K & x = rows[r * row_stride];
         tile->d[r]    = ggml_fp16_to_fp32(x.d);
@@ -194,24 +194,7 @@ static void tiled_unpack_src0_q2_K(const block_q2_K * rows, int64_t row_stride, 
     }
 }
 
-// tag-dispatched unpack: rows is the base of one (window, k-block), cast to the format's block type
-static inline void tiled_unpack_src0(tiled_fmt_q4_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
-    tiled_unpack_src0_q4_K((const block_q4_K *) rows, row_stride, n_rows, tile);
-}
-static inline void tiled_unpack_src0(tiled_fmt_q5_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q5_K * tile) {
-    tiled_unpack_src0_q5_K((const block_q5_K *) rows, row_stride, n_rows, tile);
-}
-static inline void tiled_unpack_src0(tiled_fmt_q6_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q6_K * tile) {
-    tiled_unpack_src0_q6_K((const block_q6_K *) rows, row_stride, n_rows, tile);
-}
-static inline void tiled_unpack_src0(tiled_fmt_q3_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q3_K * tile) {
-    tiled_unpack_src0_q3_K((const block_q3_K *) rows, row_stride, n_rows, tile);
-}
-static inline void tiled_unpack_src0(tiled_fmt_q2_K, const void * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q2_K * tile) {
-    tiled_unpack_src0_q2_K((const block_q2_K *) rows, row_stride, n_rows, tile);
-}
-
-// src1 tile from q8_K rows
+// unpack src1 tile from q8_K rows
 static void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
                                    const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
@@ -233,8 +216,6 @@ static void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, 
         }
     }
 #endif
-    // d and bsums: natural layout, every build; bsums stored int32 (one 64B
-    // vector load per (s, j0) on VNNI, no per-use cvt on the AVX tiers), plan 12.9
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & x = rows[r * row_stride];
@@ -249,16 +230,16 @@ static void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, 
 
 // === new tiled path (K-quants, scalar + VNNI kernel) ===
 
-// The src1 tile and the j-major float accumulator are identical for every src0 format,
-// so they are shared thread_local state; only the src0 tile differs (SUBBLK changes
-// the code density and the per-subblock side tables), so it is held per-format via
-// tiled_fmt_tile<Fmt>. A thread processes one op (one format) at a time, so sharing
-// acc/b across formats is safe: each window zeroes acc and each chunk rebuilds b.
+// All three pieces of per-thread tiled state, lazily allocated.
+// A thread processes one op at a time, so sharing across ops/formats is safe:
+// each window zeroes acc and each chunk rebuilds both tiles.
 struct tiled_kernel_ws {
+    tiled_tile_src0 * src0 = nullptr;
     tiled_tile_src1 * src1 = nullptr;
     float        * acc = nullptr;
 
     ~tiled_kernel_ws() {
+        delete src0;
         delete src1;
         // acc was allocated 64B-aligned (std::align_val_t), so free with the
         // matching aligned delete, not delete[]
@@ -269,17 +250,6 @@ struct tiled_kernel_ws {
 };
 
 static thread_local tiled_kernel_ws tiled_ws;
-
-template <typename Fmt>
-struct tiled_src0_slot {
-    typename tiled_fmt_tile<Fmt>::type * tile = nullptr;
-    ~tiled_src0_slot() { delete tile; }
-};
-template <typename Fmt>
-static tiled_src0_slot<Fmt> & tiled_get_src0_slot() {
-    static thread_local tiled_src0_slot<Fmt> s;
-    return s;
-}
 
 // GGML_CPU_TILED_MM: master switch, on by default. If off, we fast return false and normal vec_dot mul_mat resumes
 static bool ggml_tiled_matmul_enabled(void) {
@@ -329,8 +299,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
 
     // hard constraints: the kernel is only correct/defined for these
 
-    // repack-buffer weights hold a repacked layout, not the raw quants this
-    // path reads; the stock path selects the repack kernel via src0->extra
+    // repack-buffer weights hold a repacked layout, let that kernel handle
     if (src0->extra != NULL) {
         return false;
     }
@@ -342,25 +311,9 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
         return false;
     }
-    // Should trivially be true for all quant types
-    if (src0->ne[0] % 256 != 0 || src1->ne[0] != src0->ne[0]) {
-        return false;
-    }
-    // no permuted src
-    if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != ggml_type_size(src1->type)) {
-        return false;
-    }
-    // no transposed dst
-    if (dst->nb[0] != sizeof(float) || dst->nb[0] > dst->nb[1] || dst->nb[1] > dst->nb[2] || dst->nb[2] > dst->nb[3]) {
-        return false;
-    }
-
-    if (src0->ne[2] == 0 || src0->ne[3] == 0 ||
-        src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
-        return false;
-    }
 
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
+        // We can handle noncontiguous floats because we're repacking to q8_k anyways
         return false;
     }
 
@@ -411,7 +364,7 @@ static void tiled_store_window(const float * buf, int n_src0, int n_src1, int bu
     }
 }
 
-template <typename Fmt>
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS>
 static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -423,20 +376,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-
-    const size_t nb01 = src0->nb[1];
-
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
-    const size_t nb2 = dst->nb[2];
-    const size_t nb3 = dst->nb[3];
+    GGML_TENSOR_BINARY_OP_LOCALS
 
     const enum ggml_type vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
 
@@ -451,8 +391,6 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
         return;
     }
 
-    const size_t ldc = nb1 / nb0;
-
     // pure geometry of the interleave region (see tiled_interleave_geom); the
     // prepare above built it, this only derives where it sits
 #if defined(KERNEL_SRC1_UNPACK)
@@ -464,18 +402,14 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const int64_t nr1_pad = 0;
 #endif
 
-    tiled_src0_slot<Fmt> & slot = tiled_get_src0_slot<Fmt>();
-    if (!slot.tile) {
-        slot.tile = new typename tiled_fmt_tile<Fmt>::type();
+    if (!tiled_ws.src0) {
+        tiled_ws.src0 = new tiled_tile_src0();
     }
     if (!tiled_ws.src1) {
         tiled_ws.src1 = new tiled_tile_src1();
     }
     if (!tiled_ws.acc) {
-        // 64B aligned: the j-major buffer is read-modify-written with 64B vectors
-        // every k-block, and each row is 256 floats (1024B) so every access offset
-        // is a multiple of 64B. A 64B-aligned base keeps each 64B RMW inside one
-        // cache line (a misaligned 64B store would straddle two lines and dirty both).
+        // Write buffer, stays in L2 and reduces TLB pressure until we copy/transpose out to main mem at the end.
         tiled_ws.acc = static_cast<float *>(
             ::operator new(sizeof(float) * (size_t) TILED_TILE_ROWS * TILED_TILE_ROWS,
                            std::align_val_t(64)));
@@ -526,7 +460,6 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
 
             const char * src0_rows = src0_base + tile_n0 * nb01;
 
-            float * c_curr = (float *) (dst_base + tile_n0 * nb0 + i11 * nb1);
 
             // j-major buffer: zeroed once per macrotile, accumulated over all slabs and
             // microtiles (each a cheap contiguous add), then written out
@@ -535,7 +468,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
             // Compute tiles of length 256 towards our NXN output block
             for (int64_t ib = 0; ib < ne00; ib += TILE) {
                 const int kblk = (int) (ib / TILE);
-                tiled_unpack_src0(Fmt(), src0_rows + kblk * src0_bs, src0_stride, n_src0, slot.tile);
+                tiled_unpack_src0((const B *) (src0_rows + kblk * src0_bs), src0_stride, n_src0, tiled_ws.src0);
                 // tile_n1 is the flattened global row index of the window's first row
                 tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_src1, tiled_ws.src1,
                                        qv, nr1_pad, tile_n1, kblk);
@@ -546,21 +479,23 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
                         // the kernel processes the full 16x16 unconditionally, rows/cols
                         // past the window edges hold harmless tile garbage (src1 rows are
                         // zero-padded at unpack) and the store below drops them
-                        tiled_run_microtile(*slot.tile, *tiled_ws.src1,
+                        tiled_run_microtile<SUBBLK, HAS_MIN, BIAS>(*tiled_ws.src0, *tiled_ws.src1,
                             (int) (iir0 - tile_n0), (int) (iir1 - tile_n1),
                             tiled_ws.acc, TILED_TILE_ROWS);
                     }
                 }
             }
-
-            tiled_store_window(tiled_ws.acc, n_src0, n_src1, TILED_TILE_ROWS, c_curr, ldc);
+            // write out
+            const size_t ldc = nb1 / nb0;
+            float * dst_curr = (float *) (dst_base + tile_n0 * nb0 + i11 * nb1);
+            tiled_store_window(tiled_ws.acc, n_src0, n_src1, TILED_TILE_ROWS, dst_curr, ldc);
         }
         tile_n1 = tile_n1_end;
     }
 }
 
-template <typename Fmt>
-static void ggml_compute_forward_mul_mat_tiled_fmt(
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS>
+static void ggml_compute_forward_mul_mat_tiled_driver(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
@@ -620,11 +555,6 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
 #endif
 
     if (ith == 0) {
-        // result is accumulated with += below, so it must start at zero
-        memset(dst->data, 0, nb0 * ne0 * ne1 * ne2 * ne3);
-    }
-
-    if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth. This saves a bit of coordination right at the start.
         ggml_threadpool_chunk_set(params->threadpool, nth);
     }
@@ -638,14 +568,14 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
     const int64_t nr1 = ne1 * ne2 * ne3;
 
     // Now select a reasonable chunk size.
-    int chunk_size = 256;
+    int chunk_size = TILED_TILE_ROWS;
 
     // distribute the work across the inner or outer loop based on which one is larger
     // The number of chunks in the 0/1 dim. CEIL(nr/chunk_size)
     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-    // Step down chunk size if too few chunks, minimum is microtile size
+    // Step down chunk size if too few chunks to saturate cores, minimum is microtile size
     while (nchunk0 * nchunk1 < nth * 4 && chunk_size > 16) {
         chunk_size = chunk_size / 2;
         nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
@@ -659,6 +589,7 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
+    // TODO:  if we KNOW we're on a machine where all cores are equal, we could skip the coordination/work-stealing and just assign chunks deterministically
     while (current_chunk < nchunk0 * nchunk1) {
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
@@ -669,7 +600,7 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_tiled_one_chunk<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_tiled_one_chunk<B, SUBBLK, HAS_MIN, BIAS>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -682,7 +613,7 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
 bool ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
-    // the stock path is the reference; --use-ref must stay on it
+    // --use-ref means bail out and go back to vec_dot reference impl
     if (params->use_ref) {
         return false;
     }
@@ -691,19 +622,19 @@ bool ggml_compute_forward_mul_mat_tiled(
     }
     switch (dst->src[0]->type) {
         case GGML_TYPE_Q4_K:
-            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q4_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_driver<block_q4_K, 32, true,  0>(params, dst);
             break;
         case GGML_TYPE_Q5_K:
-            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q5_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_driver<block_q5_K, 32, true,  0>(params, dst);
             break;
         case GGML_TYPE_Q6_K:
-            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q6_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_driver<block_q6_K, 16, false, 32>(params, dst);
             break;
         case GGML_TYPE_Q3_K:
-            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q3_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_driver<block_q3_K, 16, false,  4>(params, dst);
             break;
         case GGML_TYPE_Q2_K:
-            ggml_compute_forward_mul_mat_tiled_fmt<tiled_fmt_q2_K>(params, dst);
+            ggml_compute_forward_mul_mat_tiled_driver<block_q2_K, 16, true,  0>(params, dst);
             break;
         default:
             return false;

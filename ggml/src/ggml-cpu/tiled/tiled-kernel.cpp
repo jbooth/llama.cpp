@@ -1,4 +1,4 @@
-// matmul microtile kernels, only optimized for x86 archs so far.
+// mulmat microtile kernels, only optimized for x86 archs so far.
 
 #include "tiled-kernel.h"
 #include "tiled.h"
@@ -11,14 +11,11 @@
 #endif
 
 // Reference implementation, slower than existing vec_dot approach
-template <typename T>
-static void tiled_run_microtile_scalar(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                        int i0, int j0, float * buf, int buf_stride) {
-    constexpr int NB = T::NB;    // subblocks per 256-K block
-    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NB = TILED_TILE_K / SUBBLK;    // subblocks per 256-K block
     constexpr int NS = SUBBLK / 16; // per-16 bsums per subblock
-    constexpr bool HAS_MIN = T::HAS_MIN_V;
-    constexpr int BIAS = T::BIAS_V;
 
     float acc[TILED_MICRO][TILED_MICRO];
     memset(acc, 0, sizeof(acc));
@@ -84,15 +81,12 @@ static void tiled_run_microtile_scalar(const T & src0, const tiled_tile_src1 & s
 // Register pressure: the band pass holds acc16 + s1_acc = 16 zmm for the
 // 8-row band (s2_acc has no dpbusd dependency, so it is computed after the
 // band pass and adds no register pressure);
-template <typename T>
-static void tiled_run_micro_vnni_int_8x16(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_micro_vnni_8x16(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                           int i0, int j0, float * buf, int buf_stride) {
-    constexpr int NB = T::NB;
-    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NB = TILED_TILE_K / SUBBLK;
     constexpr int NS = SUBBLK / 16;
     constexpr int NG = SUBBLK / 4;
-    constexpr bool HAS_MIN = T::HAS_MIN_V;
-    constexpr int BIAS = T::BIAS_V;
 
     // band width, see the register-pressure note above
     constexpr int NUM_ROWS = 8;
@@ -121,7 +115,7 @@ static void tiled_run_micro_vnni_int_8x16(const T & src0, const tiled_tile_src1 
         __m512i acc16[NUM_ROWS];
         for (int t = 0; t < NUM_ROWS; t++) { acc16[t] = _mm512_setzero_si512(); }
 
-        #pragma GCC unroll 8
+        #pragma GCC unroll 8 // pragma unrolled justified by measuing with/without
         for (int g = 0; g < NG; g++) {
             const int kg = s * NG + g;
             const __m512i codes = _mm512_loadu_si512((const __m512i *) &src1.q[kg * TILED_TILE_ROWS * 4 + j0 * 4]);
@@ -174,16 +168,16 @@ static void tiled_run_micro_vnni_int_8x16(const T & src0, const tiled_tile_src1 
 }
 
 // 16x16 microtile as two explicit 8x16 band passes
-template <typename T>
-static void tiled_run_microtile_vnni_int(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_microtile_vnni(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                          int i0, int j0, float * buf, int buf_stride) {
-    tiled_run_micro_vnni_int_8x16(src0, src1, i0,      j0, buf, buf_stride);
-    tiled_run_micro_vnni_int_8x16(src0, src1, i0 + 8,  j0, buf, buf_stride);
+    tiled_run_micro_vnni_8x16<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0,      j0, buf, buf_stride);
+    tiled_run_micro_vnni_8x16<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0 + 8,  j0, buf, buf_stride);
 }
 
 #endif // __AVX512VNNI__ && __AVX512VL__
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(__AVX512VNNI__) && !defined(__AVX512VL__) && !defined(__AVX512DQ__)
 // AVX2 kernel.
 // We're effectively applying the existing vec_dot algorithms to an 8x16 block here.
 // Different paths based on subblock size as it affects when/where we multiply in scales and apply mins
@@ -192,13 +186,10 @@ static void tiled_run_microtile_vnni_int(const T & src0, const tiled_tile_src1 &
 // SUBBLK=16: two subblocks per 32B load. The 256-bit maddubs product
 // still gives 16 i16 lanes (0..7 = subblock sp, 8..15 = sp+1), but the
 // scale is applied per 128-bit half
-template <typename T>
-static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                      int i0, int j0, float * buf, int buf_stride) {
-    constexpr int NB = T::NB;
-    constexpr int SUBBLK = TILED_TILE_K / NB;
-    constexpr bool HAS_MIN = T::HAS_MIN_V;
-    constexpr int BIAS = T::BIAS_V;
+    constexpr int NB = TILED_TILE_K / SUBBLK;
     constexpr int GROUP = 8; // src1 columns per group: one acc32 per column
 
     static_assert(SUBBLK == 16 || SUBBLK == 32, "unsupported SUBBLK");
@@ -323,14 +314,11 @@ static void tiled_run_microtile_avx2(const T & src0, const tiled_tile_src1 & src
 #endif // __AVX2__
 
 #if defined(__AVX__) && !defined(__AVX2__)
-template <typename T>
-static void tiled_run_microtile_avx(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_microtile_avx(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                     int i0, int j0, float * buf, int buf_stride) {
-    constexpr int NB = T::NB;
-    constexpr int SUBBLK = TILED_TILE_K / NB;
+    constexpr int NB = TILED_TILE_K / SUBBLK;
     constexpr int NS = SUBBLK / 16;
-    constexpr bool HAS_MIN = T::HAS_MIN_V;
-    constexpr int BIAS = T::BIAS_V;
     constexpr int GROUP = 4; // src1 columns per group: one acc32 per column
 
     for (int i = 0; i < TILED_MICRO; i++) {
@@ -402,29 +390,29 @@ static void tiled_run_microtile_avx(const T & src0, const tiled_tile_src1 & src1
 #endif // __AVX__ && !__AVX2__
 
 // main microtile entry point
-template <typename T>
-void tiled_run_microtile(const T & src0, const tiled_tile_src1 & src1,
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-    tiled_run_microtile_vnni_int(src0, src1, i0, j0, buf, buf_stride);
+    tiled_run_microtile_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, buf, buf_stride);
 #elif defined(__AVX2__)
-    tiled_run_microtile_avx2(src0, src1, i0, j0, buf, buf_stride);
+    tiled_run_microtile_avx2<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, buf, buf_stride);
 #elif defined(__AVX__)
-    tiled_run_microtile_avx(src0, src1, i0, j0, buf, buf_stride);
+    tiled_run_microtile_avx<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, buf, buf_stride);
 #else
-    tiled_run_microtile_scalar(src0, src1, i0, j0, buf, buf_stride);
+    tiled_run_microtile_scalar<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, buf, buf_stride);
 #endif
 }
 
-// explicit instantiations for the in-use tile types (q4_K and q5_K share the layout)
-template void tiled_run_microtile<tiled_tile_src0_q4_K>(const tiled_tile_src0_q4_K & src0, const tiled_tile_src1 & src1,
-                                                       int i0, int j0, float * buf, int buf_stride);
-template void tiled_run_microtile<tiled_tile_src0_q6_K>(const tiled_tile_src0_q6_K & src0, const tiled_tile_src1 & src1,
-                                                       int i0, int j0, float * buf, int buf_stride);
-template void tiled_run_microtile<tiled_tile_src0_q3_K>(const tiled_tile_src0_q3_K & src0, const tiled_tile_src1 & src1,
-                                                       int i0, int j0, float * buf, int buf_stride);
-template void tiled_run_microtile<tiled_tile_src0_q2_K>(const tiled_tile_src0_q2_K & src0, const tiled_tile_src1 & src1,
-                                                       int i0, int j0, float * buf, int buf_stride);
+// explicit instantiations for the in-use formats (q4_K and q5_K share the constants)
+template void tiled_run_microtile<32, true, 0>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                               int i0, int j0, float * buf, int buf_stride);
+template void tiled_run_microtile<16, false, 32>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                                 int i0, int j0, float * buf, int buf_stride);
+template void tiled_run_microtile<16, false, 4>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                                int i0, int j0, float * buf, int buf_stride);
+template void tiled_run_microtile<16, true, 0>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                               int i0, int j0, float * buf, int buf_stride);
 
 
 #if defined(KERNEL_SRC1_UNPACK)
