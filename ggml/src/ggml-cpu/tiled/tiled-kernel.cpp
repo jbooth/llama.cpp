@@ -426,45 +426,6 @@ template void tiled_run_microtile<tiled_tile_src0_q3_K>(const tiled_tile_src0_q3
 template void tiled_run_microtile<tiled_tile_src0_q2_K>(const tiled_tile_src0_q2_K & src0, const tiled_tile_src1 & src1,
                                                        int i0, int j0, float * buf, int buf_stride);
 
-// Transpose-store the j-major buffer to dst (i contiguous).
-void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride, float * dst, size_t dst_stride) {
-    int ri = 0;
-    for (; ri + 8 <= n_src0; ri += 8) {
-        int rj = 0;
-        for (; rj + 8 <= n_src1; rj += 8) {
-#if defined(__AVX2__)
-            float r[8][8];
-            for (int t = 0; t < 8; t++) {
-                _mm256_storeu_ps(&r[t][0], _mm256_loadu_ps(&buf[(ri + t) * buf_stride + rj]));
-            }
-            for (int u = 0; u < 8; u++) {
-                float col[8];
-                for (int t = 0; t < 8; t++) col[t] = r[t][u];
-                _mm256_storeu_ps(&dst[ri + (size_t)(rj + u) * dst_stride], _mm256_loadu_ps(col));
-            }
-#else
-            for (int u = 0; u < 8; u++) {
-                for (int t = 0; t < 8; t++) {
-                    dst[(ri + t) + (size_t)(rj + u) * dst_stride] = buf[(ri + t) * buf_stride + (rj + u)];
-                }
-            }
-#endif
-        }
-        // ragged j tail
-        for (; rj < n_src1; rj++) {
-            for (int t = 0; t < 8; t++) {
-                dst[(ri + t) + (size_t)rj * dst_stride] = buf[(ri + t) * buf_stride + rj];
-            }
-        }
-    }
-    // ragged i tail
-    for (; ri < n_src0; ri++) {
-        for (int j = 0; j < n_src1; j++) {
-            dst[ri + (size_t)j * dst_stride] = buf[ri * buf_stride + j];
-        }
-    }
-}
-
 
 #if defined(KERNEL_SRC1_UNPACK)
 

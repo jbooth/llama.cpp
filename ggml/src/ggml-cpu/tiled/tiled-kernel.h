@@ -4,7 +4,6 @@
 
 // Currently only optimized for x86, new architectures should implement:
 // tiled_run_microtile:  16x16 microkernel
-// tiled_store_window: Writeback of 256x256 window (default fallback may be good enough)
 // bit unpacking routines: tiled_unpk_nib4, tiled_unpk_2bit, tiled_unpk_or
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -126,9 +125,6 @@ inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
 template <typename T> // T = tiled_tile_src0<...>
 void tiled_run_microtile(const T & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride);
-
-// Transpose-store the window buffer (256x256 max size) to dst: dst[(ri + t) + (rj + u) * dst_stride] = buf[(ri + t) * buf_stride + (rj + u)]
-void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride, float * dst, size_t dst_stride);
 
 
 // Defined when this arch's kernel reads the src1 tile codes in a non-natural

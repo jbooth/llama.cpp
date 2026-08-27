@@ -388,6 +388,44 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     return true;
 }
 
+// Writeback of the 256x256 window: buf is j-major (row stride buf_stride),
+// dst is i-major (column stride dst_stride).
+// Pure C: stage 16 buf rows (32B each) on the stack, then write 8 dst columns
+// of 16 contiguous floats (64B) each; both sides vectorize per ISA at build
+// time. Ragged window edges fall back to scalar.
+static void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride,
+                               float * dst, size_t dst_stride) {
+    int ri = 0;
+    for (; ri + 16 <= n_src0; ri += 16) {
+        int rj = 0;
+        for (; rj + 8 <= n_src1; rj += 8) {
+            float r[16][8];
+            for (int t = 0; t < 16; t++) {
+                for (int u = 0; u < 8; u++) {
+                    r[t][u] = buf[(ri + t) * buf_stride + rj + u];
+                }
+            }
+            for (int u = 0; u < 8; u++) {
+                for (int t = 0; t < 16; t++) {
+                    dst[(ri + t) + (size_t) (rj + u) * dst_stride] = r[t][u];
+                }
+            }
+        }
+        // ragged j tail
+        for (; rj < n_src1; rj++) {
+            for (int t = 0; t < 16; t++) {
+                dst[(ri + t) + (size_t) rj * dst_stride] = buf[(ri + t) * buf_stride + rj];
+            }
+        }
+    }
+    // ragged i tail
+    for (; ri < n_src0; ri++) {
+        for (int j = 0; j < n_src1; j++) {
+            dst[ri + (size_t) j * dst_stride] = buf[ri * buf_stride + j];
+        }
+    }
+}
+
 template <typename Fmt>
 static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const struct ggml_compute_params * params,
