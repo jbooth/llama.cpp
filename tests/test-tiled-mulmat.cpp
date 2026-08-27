@@ -453,6 +453,9 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
 
     ggml_backend_alloc_ctx_tensors(ctx, backend);
 
+    // fixed seed so the bench data (and hence max_err/rmse) is a stable
+    // fingerprint across runs, independent of the preceding correctness cases
+    srand(0xBEEF);
     float * src1_data = gen_rand_f32(M * N);
     float * src0_data = gen_rand_f32(N * K);
     // src0 is K rows of N in ggml layout, so transpose src0 into it

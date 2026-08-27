@@ -13,21 +13,9 @@
 
 #include <new>
 
-// Additional space needed for repacking src1.  Only VNNI uses extra space.
-size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
-#if defined(KERNEL_SRC1_UNPACK)
-    const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
-    const int64_t nr1_pad = (nr1 + 15) & ~15LL;
-    return (size_t) k1_pad * (size_t) nr1_pad;
-#else
-    (void) ne10;
-    (void) nr1;
-    return 0;
-#endif
-}
+#define UNUSED GGML_UNUSED
 
-// === src0/src1 unpack (driver space; the VNNI code fill delegates to the kernel) ===
-
+// unpack routines for various quant types src0, q8_k src1
 static void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
     constexpr int NB = tiled_tile_src0_q4_K::NB;
@@ -133,7 +121,7 @@ static void tiled_unpack_src0_q6_K(const block_q6_K * rows, int64_t row_stride, 
             tiled_unpk_or<4, 4, 3>(out + 64, x.qh + 32 * half);
             tiled_unpk_or<6, 4, 3>(out + 96, x.qh + 32 * half);
         }
-// scale is a plain int8 per 16-element subblock (16 per 256-K)
+        // scale is a plain int8 per 16-element subblock (16 per 256-K)
         for (int s = 0; s < NB; s++) { tile->scales[r * NB + s] = (int32_t) (int8_t) x.scales[s]; }
     }
 }
@@ -223,22 +211,20 @@ static inline void tiled_unpack_src0(tiled_fmt_q2_K, const void * rows, int64_t 
     tiled_unpack_src0_q2_K((const block_q2_K *) rows, row_stride, n_rows, tile);
 }
 
-// src1 tile from q8_K rows: one memcpy per row in natural [row][k] order, plus
-// d and bsums; every build. On builds where the kernel reads the codes in a
-// different order (KERNEL_SRC1_UNPACK, i.e. x86 VNNI), the code fill is
-// delegated to the kernel's op, which copies from the up-front interleaved
-// region; d and bsums stay here.
+// src1 tile from q8_K rows
 static void tiled_unpack_src1_q8_K(const block_q8_K * rows, int64_t row_stride, int n_rows, tiled_tile_src1 * tile,
                                    const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
 #if defined(KERNEL_SRC1_UNPACK)
+    // Kernel-defined unpack for VNNI
     tiled_unpack_src1_q8_K_kernel(n_rows, tile, qv, nr1_pad, r_start, kblk);
 #else
-    (void) qv;
-    (void) nr1_pad;
-    (void) r_start;
-    (void) kblk;
+    // Straight row copy for normal contiguous rows
+    UNUSED(qv);
+    UNUSED(nr1_pad);
+    UNUSED(r_start);
+    UNUSED(kblk);
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             memcpy(&tile->q[r * TILED_TILE_K], rows[r * row_stride].qs, TILED_TILE_K);
@@ -295,16 +281,7 @@ static tiled_src0_slot<Fmt> & tiled_get_src0_slot() {
     return s;
 }
 
-// process-wide switches, read once per process. The plan and the compute
-// hook both go through the gate below, so one read keeps the wdata
-// reservation and the take decision in sync.
-//
-// GGML_CPU_TILED_MM: master switch, on by default; the gate below then
-// decides take/fallback per op. Setting it to 0 opts out of the feature
-// entirely (no take, no reservation).
-// GGML_CPU_TILED_MM_FORCE: test/bench only; take the tiled path even where
-// the profitability check below rejects. Subordinate to the master switch
-// and never relaxes the hard constraints.
+// GGML_CPU_TILED_MM: master switch, on by default. If off, we fast return false and normal vec_dot mul_mat resumes
 static bool ggml_tiled_matmul_enabled(void) {
     static bool enabled = true;
     static bool inited  = false;
@@ -316,6 +293,7 @@ static bool ggml_tiled_matmul_enabled(void) {
     return enabled;
 }
 
+// GGML_CPU_TILED_MM_FORCE: test/bench only, take the tiled path even when unprofitable
 static bool ggml_tiled_matmul_forced(void) {
     static bool forced = false;
     static bool inited  = false;
@@ -327,7 +305,21 @@ static bool ggml_tiled_matmul_forced(void) {
     return forced;
 }
 
-// shape/type gate; anything not supported here runs the old path
+// Additional space needed for repacking src1.  Only VNNI uses extra space.
+size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
+#if defined(KERNEL_SRC1_UNPACK)
+    if (ggml_tiled_matmul_enabled()) {
+        const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
+        const int64_t nr1_pad = (nr1 + 15) & ~15LL;
+        return (size_t) k1_pad * (size_t) nr1_pad;
+    }
+#endif
+    UNUSED(ne10);
+    UNUSED(nr1);
+    return 0;
+}
+
+// compatibility/profitability gate.  anything not supported here will fall back to the vec_dot path
 static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
                                         const struct ggml_tensor * src1,
                                         const struct ggml_tensor * dst) {
@@ -335,14 +327,14 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
         return false;
     }
 
-    // hard constraints: the kernel is only correct/defined for these; the
-    // force switch never relaxes them
+    // hard constraints: the kernel is only correct/defined for these
+
     // repack-buffer weights hold a repacked layout, not the raw quants this
     // path reads; the stock path selects the repack kernel via src0->extra
     if (src0->extra != NULL) {
         return false;
     }
-    // K-quant weights only (the gateway switch grows per phase)
+    // K-quant weights only
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
         src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q2_K) {
         return false;
@@ -350,7 +342,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_Q8_K) {
         return false;
     }
-    // reduction dim must be a multiple of the 256-K tile
+    // Should trivially be true for all quant types
     if (src0->ne[0] % 256 != 0 || src1->ne[0] != src0->ne[0]) {
         return false;
     }
@@ -362,26 +354,22 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
     if (dst->nb[0] != sizeof(float) || dst->nb[0] > dst->nb[1] || dst->nb[1] > dst->nb[2] || dst->nb[2] > dst->nb[3]) {
         return false;
     }
-    // src0 batch dims broadcast over src1 batch dims (the kernel maps src0
-    // batch coords down with i02 = i12/r2, i03 = i13/r3, as in the stock path)
+
     if (src0->ne[2] == 0 || src0->ne[3] == 0 ||
         src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
         return false;
     }
-    // src1 rows must be addressable as contiguous rows (wdata is contiguous by construction)
+
     if (src1->type == GGML_TYPE_Q8_K && !ggml_is_contiguous(src1)) {
         return false;
     }
 
-    // the force switch (test/bench only) takes what the profitability
-    // check below would reject
+    // If forced, skip profitability check
     if (ggml_tiled_matmul_forced()) {
         return true;
     }
 
-    // small M (decode): the weight tile unpack is paid once per op and only amortized
-    // over M rows; below this the stock vec_dot/GEMV path wins (no row is processed
-    // twice, so there is no reuse to offset the unpack)
+    // We are slightly profitable at 64 rows, unprofitable below, fall back to optimized vec_dot
     if (src1->ne[1] < 64) {
         return false;
     }
@@ -390,9 +378,6 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
 
 // Writeback of the 256x256 window: buf is j-major (row stride buf_stride),
 // dst is i-major (column stride dst_stride).
-// Pure C: stage 16 buf rows (32B each) on the stack, then write 8 dst columns
-// of 16 contiguous floats (64B) each; both sides vectorize per ISA at build
-// time. Ragged window edges fall back to scalar.
 static void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride,
                                float * dst, size_t dst_stride) {
     int ri = 0;
