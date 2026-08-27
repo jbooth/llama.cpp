@@ -1,22 +1,20 @@
 #pragma once
 
-// Tiled matmul kernel API: tile structs, format tags, per-ISA microtile kernel
-// entry points, and the arch-specific src1 code unpack op (VNNI).
-// C++ for the per-format template config (SUBBLK, HAS_MIN, BIAS); C-style code otherwise.
-// K-quant weights x q8_K activations; per-ISA branches in the kernel (scalar,
-// AVX, AVX2, AVX512-VNNI).
+// Tiled matmul kernel API: tile structs, kernel definitions
 
+// Currently only optimized for x86, new architectures should implement:
+// tiled_run_microtile:  16x16 microkernel
+// tiled_store_window: Writeback of 256x256 window (default fallback may be good enough)
+// bit unpacking routines: tiled_unpk_nib4, tiled_unpk_2bit, tiled_unpk_or
 #include "ggml-quants.h"
+#include "ggml.h"
+#include "ggml-cpu-impl.h" // ggml_compute_params; no-op for the consumers, which include it first
 
 #include <stddef.h>
 #include <stdint.h>
 
-// Defined when this arch's kernel reads the src1 tile codes in a non-natural
-// order (x86 VNNI: [k/4][row][4], fed from the up-front interleaved region).
-// The kernel then provides tiled_unpack_src1_q8_K_kernel, which the driver's
-// src1 unpack calls instead of its generic per-row memcpy
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-#define KERNEL_SRC1_UNPACK 1
+#if defined(__AVX2__)
+#include <immintrin.h>
 #endif
 
 #define TILED_TILE_K    256 // one QK_K block
@@ -25,14 +23,11 @@
 
 // src1 tile: built from q8_K (wdata), shared by all src0 formats.
 struct tiled_tile_src1 {
-    // signed q8 codes, 256 x 256, 64B aligned. The compiled kernel -- not the
-    // unpack -- chooses the byte order: natural [row][k] on the scalar/AVX/AVX2
-    // tiers, [k/4][row][4] on VNNI (one 64B dpbusd vector per k-group x 16 rows).
+    // q8 codes, one byte per element. Note for VNNI these are reshaped + transposed to be suitable for dpbusd.
     alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];
-    // s-major per-16 code sums, [s][row]; int32 (model stores int16): one 64B vector load
-    // per (s, j0) on VNNI, no per-use cvt on the AVX tiers; L2-resident, width costs nothing
+    // per-16 code sums from q8_k (int16), widened to int32 so the kernels load them directly, no per-use cvt
     alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
-    // f32 (not f16): the model stores fp16, the unpack converts once
+    // f32 (not f16): q8_k stores fp16, the unpack converts once
     float       d[TILED_TILE_ROWS];
 };
 
@@ -42,33 +37,25 @@ struct tiled_tile_src0 {
     static constexpr bool HAS_MIN_V = HAS_MIN; // re-exposed for the kernel templates (which take only the type)
     static constexpr int BIAS_V = BIAS;
     static constexpr int NB = TILED_TILE_K / SUBBLK; // subblocks per 256-K block
-    // one byte per element (4/5/6-bit value in the low bits); unsigned: maddubs/dpbusd take (u8, s8)
-    alignas(32) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; // unsigned codes
+    
+    // unsigned quants, expanded to 8bit
+    alignas(32) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; 
     // f32 (not f16): the model stores fp16, the unpack converts once
-    float    d[TILED_TILE_ROWS];
-    float    dmin[TILED_TILE_ROWS];         // used when HAS_MIN
-    // per-subblock side coefficients, one (row, s) pair each, applied per exact integer
-    // subblock dot:  out += d * scales[r][s] * dot(codes)  -  dmin * mins[r][s] * sum(src1 codes)
-    // scales (the model block's scales field) scales the int code dot, mins scales the src1-side
-    // code sum (tile->bsums); mins is only used by HAS_MIN formats (q2/q4/q5_K). q3_K stores
-    // scales as (raw 6-bit scale - 32) (its q1 code offset is handled via BIAS). q6_K uses
-    // only scales.
-    // int32 though the values fit int8: broadcast straight from memory, no per-use sign-extend (12.9)
-    int32_t   scales[TILED_TILE_ROWS * NB];  // per-subblock scale (q3_K: stored as raw-32)
+    float    d[TILED_TILE_ROWS];  // One d from each input block, widened to f32
+    float    dmin[TILED_TILE_ROWS]; // dmin from each input block (if applicable), widened to F32
+    // per-subblock side coefficients
+    int32_t   scales[TILED_TILE_ROWS * NB];  // per-subblock scale, stored as int32_t
     int32_t   mins[TILED_TILE_ROWS * NB];      // per-subblock min, used when HAS_MIN
-    // NB: a BIAS != 0 format needs NO src0-side code sum. sum(src1 codes) with c = u - BIAS
-    // = sum(u*src1 code) - BIAS*sum(src1 code): the bias term is BIAS times the src1-side per-subblock
-    // bsum (tile_src1->bsums), which the kernel already combines. No src0 sumq is stored.
 };
 
-// worst-case instantiation (SUBBLK = 16, HAS_MIN) + src1 tile must stay under the per-thread budget
+// Ensure total size under 512kb for L2 cache fit
 static_assert(sizeof(tiled_tile_src0<16, true, 0>) + sizeof(tiled_tile_src1) < 512 * 1024,
               "tiled tile memory budget exceeded");
 
 // q4_K and q5_K share the tile layout: 32-wide subblocks, min, no bias, 1-byte codes
 typedef tiled_tile_src0<32, true, 0> tiled_tile_src0_q4_K;
 typedef tiled_tile_src0<32, true, 0> tiled_tile_src0_q5_K;
-// q6_K/q3_K/q2_K use 16-wide subblocks (NB=16). q6_K/q3_K carry a BIAS (corrected via
+// q6_K/q3_K/q2_K use 16-wide subblocks (NB=16). q6_K/q3_K carry a bias (corrected via
 // the src1 bsums); q2_K uses per-16 min, no bias.
 typedef tiled_tile_src0<16, false, 32> tiled_tile_src0_q6_K;
 typedef tiled_tile_src0<16, false, 4>  tiled_tile_src0_q3_K;
@@ -89,46 +76,93 @@ template <> struct tiled_fmt_tile<tiled_fmt_q6_K> { using type = tiled_tile_src0
 template <> struct tiled_fmt_tile<tiled_fmt_q3_K> { using type = tiled_tile_src0_q3_K; };
 template <> struct tiled_fmt_tile<tiled_fmt_q2_K> { using type = tiled_tile_src0_q2_K; };
 
-// VNNI-only (KERNEL_SRC1_UNPACK): the dpbusd kernel reads the src1 tile codes
-// in the [k/4][row][4] order, so the driver's generic per-row memcpy cannot
-// fill the tile; this op does, from the up-front interleaved region (qv,
-// non-null; r_start = global index of the window's first row, kblk = slab).
-// d and bsums are still filled by the driver's unpack
-#if defined(KERNEL_SRC1_UNPACK)
-void tiled_unpack_src1_q8_K_kernel(int n_rows, tiled_tile_src1 * tile,
-                                   const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
+
+// 32-byte-unit unpack primitives for the src0 code expansion (the driver's
+// per-format unpackers use them). All codes are bitfields with no overlap,
+// so merging a flag into an extracted code uses OR (== ADD here, matches the
+// reference kernels). ymm under __AVX2__, plain loops otherwise; the output
+// bytes are bit-identical either way
+#if defined(__AVX2__)
+// packed 4-bit codes -> low nibbles (lo) + high nibbles (hi)
+inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
+    const __m256i v = _mm256_loadu_si256((const __m256i *) src);
+    // mask before the lane shift so bits do not cross byte boundaries
+    _mm256_storeu_si256((__m256i *) lo, _mm256_and_si256(v, _mm256_set1_epi8(0x0F)));
+    _mm256_storeu_si256((__m256i *) hi, _mm256_srli_epi32(_mm256_and_si256(v, _mm256_set1_epi8((int8_t) 0xF0)), 4));
+}
+// 2-bit values at bit offset S
+template <int S> inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
+    _mm256_storeu_si256((__m256i *) dst, _mm256_and_si256(
+        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8(0x03)));
+}
+// OR the M-bit value at bit offset S of src into bit offset D of dst
+template <int S, int D, int M>
+inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
+    const __m256i v = _mm256_slli_epi32(_mm256_and_si256(
+        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8((uint8_t) M)), D);
+    _mm256_storeu_si256((__m256i *) dst, _mm256_or_si256(_mm256_loadu_si256((const __m256i *) dst), v));
+}
+#else
+inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
+    for (int l = 0; l < 32; l++) { lo[l] = (uint8_t) (src[l] & 0xF); hi[l] = (uint8_t) (src[l] >> 4); }
+}
+template <int S>
+inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
+    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) ((src[l] >> S) & 3); }
+}
+template <int S, int D, int M>
+inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
+    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) (dst[l] | (((src[l] >> S) & M) << D)); }
+}
 #endif
 
-// info for the src1 interleave region built by tiled_prepare_src1_interleave:
-// qv = base of the up-front [slab][k/4][row][4] code region (null when not
-// built, i.e. non-VNNI), nr1_pad = the region's row count padded to 16 (0 then)
-struct tiled_src1_interleave {
-    const int8_t * qv;
-    int64_t       nr1_pad;
-};
-
-// one-shot, all-threads build of the src1 interleave region: partitions the
-// tiled_interleave_src1_q8_K scatter across threads, sizes/locates the wdata
-// region, and barriers the F32->q8 conversion first. No-op on non-VNNI (returns
-// {nullptr, 0}); the driver always calls it
-struct ggml_compute_params;
-tiled_src1_interleave tiled_prepare_src1_interleave(const struct ggml_compute_params * params,
-                                                    const struct ggml_tensor * src1,
-                                                    enum ggml_type vec_dot_type,
-                                                    int64_t ne10, int64_t nr1, int ith, int nth);
 
 // Accumulate one 16x16 microtile (src0 rows [i0, i0+16), src1 cols [j0, j0+16))
 // over the full 256-K slab held in the tiles into a j-major float buffer
-// (row width buf_stride): buf[i*buf_stride + j] += partial. i0/j0 are
-// multiples of TILED_MICRO and within TILED_TILE_ROWS; rows/cols past the
-// window hold harmless tile garbage and the driver's store drops them.
+// (row width buf_stride): buf[i*buf_stride + j] += partial.
+// 
 // No store to dst here: the driver holds the buffer across the 256-K slabs
 // and transpose-stores it once, so each dst element is written a single time.
 template <typename T> // T = tiled_tile_src0<...>
 void tiled_run_microtile(const T & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride);
 
-// Transpose-store the j-major buffer to dst: dst[i][j] = dst[i + j*dst_stride] (i contiguous),
-// n_src0 rows x n_src1 cols, buffer row width buf_stride. Written with = (the buffer holds
-// the full sum for the window and the region is thread-exclusive).
+// Transpose-store the window buffer (256x256 max size) to dst: dst[(ri + t) + (rj + u) * dst_stride] = buf[(ri + t) * buf_stride + (rj + u)]
 void tiled_store_window(const float * buf, int n_src0, int n_src1, int buf_stride, float * dst, size_t dst_stride);
+
+
+// Defined when this arch's kernel reads the src1 tile codes in a non-natural
+// order, in this case driver should call kernel methods `tiled_prepare_src1_interleave`
+// and `tiled_unpack_src1_q8_K_kernel` to prepare the tensor and macrotiles, respectively.
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+#define KERNEL_SRC1_UNPACK 1
+#endif
+
+
+#if defined(KERNEL_SRC1_UNPACK)
+// VNNI-only (KERNEL_SRC1_UNPACK): the dpbusd kernel reads the src1 tile codes
+// in the [k/4][row][4] order instead of standard row-major
+void tiled_unpack_src1_q8_K_kernel(int n_rows, tiled_tile_src1 * tile,
+                                   const int8_t * qv, int64_t nr1_pad, int64_t r_start, int64_t kblk);
+
+// geometry of the src1 interleave region in wdata (stubs on non-VNNI builds)
+struct tiled_interleave_geom {
+    int8_t       * qv;      // base of the [slab][k/4][row][4] code region (null when not built)
+    int64_t       nr1_pad;  // row count padded to 16 (0 then)
+    size_t        bytes;    // wdata reservation size for the region (0 then)
+};
+
+tiled_interleave_geom tiled_get_interleave_geom(const struct ggml_compute_params * params,
+                                                const struct ggml_tensor * src1,
+                                                enum ggml_type vec_dot_type,
+                                                int64_t ne10, int64_t nr1);
+
+// The q8 codes of the whole tensor are scattered into a flat [slab][k/4-in-slab][row][4] wdata region 
+// (rows padded to 16, zeroed tail) so the per (window, slab) unpack becomes a contiguous copy.
+void tiled_prepare_src1_interleave(const struct ggml_compute_params * params,
+                                   const struct ggml_tensor * src1,
+                                   enum ggml_type vec_dot_type,
+                                   int64_t ne10, int64_t nr1, int ith, int nth);
+
+#endif
+

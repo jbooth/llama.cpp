@@ -258,10 +258,12 @@ void test_matmul(ggml_backend_t backend, int64_t M, int64_t N, int64_t K, ggml_t
 // src0 (quant): [N, K, src0_2, src0_3]   ne0=N (reduction), ne1=K (out1)
 // dst = ggml_mul_mat(src0, src1) : [K, M, src1_2, src1_3]
 //
-// The new tiled kernel requires exact batch match (src1_2==src0_2 && src1_3==src0_3) plus
-// N%256==0 and M>=64; broadcast shapes (src1_2>src0_2 or src1_3>src0_3) fall back to the
-// explicit-dequant path. The reference additionally requires src1_2%src0_2==0 and
-// src1_3%src0_3==0 (broadcastable), which both paths here satisfy.
+// The tiled path is gated by ggml_tiled_matmul_supported: N%256==0, src0 batch
+// dims divide src1 batch dims (broadcast), and M>=64 (profitability; the
+// harness runs with force on, so that check is bypassed). Shapes the gate
+// rejects run the stock path. The reference additionally requires
+// src1_2%src0_2==0 and src1_3%src0_3==0 (broadcastable), which all cases
+// here satisfy.
 void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K,
                          int64_t src1_2, int64_t src1_3,
                          int64_t src0_2, int64_t src0_3,
@@ -333,7 +335,7 @@ void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, int64_t K
     printf("TEST %lldx%lldx%lldx%lld * %lldx%lldx%lldx%lld (%s, %s): %s (max_err: %f, rms: %f, scale: %f)\n",
            (long long)M, (long long)N, (long long)src1_2, (long long)src1_3,
            (long long)K, (long long)N, (long long)src0_2, (long long)src0_3,
-           ggml_type_name(quant_type), tiled_kernel ? "tiled-kernel" : "explicit-fallback",
+           ggml_type_name(quant_type), tiled_kernel ? "tiled-kernel" : "stock",
            (max_err <= tol) ? "PASS" : "FAIL", max_err, rms_err, scale);
 
     if (max_err > tol) {
@@ -613,8 +615,8 @@ int main(int argc, char ** argv) {
     test_matmul(backend, 257, 512, 17, GGML_TYPE_Q5_K);
 
     // higher-dim (ne[2], ne[3] > 1): bug-for-bug vs std on identical weights.
-    // equal-batch shapes (src1_2==src0_2, src1_3==src0_3) run the new tiled kernel; the
-    // broadcast shapes (src1_2=2*src0_2) exercise the explicit-dequant fallback.
+    // equal-batch and broadcast shapes (src1_2=2*src0_2, src1_3=2*src0_3) all
+    // run the tiled kernel (the gate accepts broadcast-divisible batches).
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q4_K); // 3D, tiled
     test_matmul_highdim(backend, 1024, 1024, 1024, 1, 2, 1, 2, GGML_TYPE_Q4_K); // 3D, tiled
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q4_K); // 4D, tiled
@@ -641,12 +643,12 @@ int main(int argc, char ** argv) {
     const ggml_type bench_types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
     const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
     struct { int64_t M, N, K; } shapes[] = {
-        { 8192, 8192, 8192 },
+        //{ 8192, 8192, 8192 },
         { 4096, 4096, 4096 },
         { 4096, 4096,   64 },
-        { 4096, 4096,   32 },
-        { 4096, 4096,   16 },
-        { 4096, 4096,   8 },
+        //{ 4096, 4096,   32 },
+        //{ 4096, 4096,   16 },
+        //{ 4096, 4096,   8 },
         { 4096, 4096,   1 },
     };
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {

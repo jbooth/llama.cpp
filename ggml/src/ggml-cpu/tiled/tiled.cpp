@@ -13,46 +13,20 @@
 
 #include <new>
 
-#define QK_K 256 // TODO why don't we pick this up properly from headers
+// Additional space needed for repacking src1.  Only VNNI uses extra space.
+size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
+#if defined(KERNEL_SRC1_UNPACK)
+    const int64_t k1_pad = (ne10 + 255) & ~255LL; // the region holds whole slabs
+    const int64_t nr1_pad = (nr1 + 15) & ~15LL;
+    return (size_t) k1_pad * (size_t) nr1_pad;
+#else
+    (void) ne10;
+    (void) nr1;
+    return 0;
+#endif
+}
 
 // === src0/src1 unpack (driver space; the VNNI code fill delegates to the kernel) ===
-
-// 32-byte-unit unpack primitives for the src0-format code expansion. All codes are
-// bitfields with no overlap, so merging a flag into an already-extracted code uses OR
-// (identical to ADD, matches the reference kernels' semantics).
-#if defined(__AVX2__)
-// packed 4-bit codes -> low nibbles (lo) + high nibbles (hi)
-static inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
-    const __m256i v = _mm256_loadu_si256((const __m256i *) src);
-    // mask before the lane shift so bits do not cross byte boundaries
-    _mm256_storeu_si256((__m256i *) lo, _mm256_and_si256(v, _mm256_set1_epi8(0x0F)));
-    _mm256_storeu_si256((__m256i *) hi, _mm256_srli_epi32(_mm256_and_si256(v, _mm256_set1_epi8((int8_t) 0xF0)), 4));
-}
-// 2-bit values at bit offset S
-template <int S> static inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
-    _mm256_storeu_si256((__m256i *) dst, _mm256_and_si256(
-        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8(0x03)));
-}
-// OR the M-bit value at bit offset S of src into bit offset D of dst
-template <int S, int D, int M>
-static inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
-    const __m256i v = _mm256_slli_epi32(_mm256_and_si256(
-        _mm256_srli_epi32(_mm256_loadu_si256((const __m256i *) src), S), _mm256_set1_epi8((uint8_t) M)), D);
-    _mm256_storeu_si256((__m256i *) dst, _mm256_or_si256(_mm256_loadu_si256((const __m256i *) dst), v));
-}
-#else
-static inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
-    for (int l = 0; l < 32; l++) { lo[l] = (uint8_t) (src[l] & 0xF); hi[l] = (uint8_t) (src[l] >> 4); }
-}
-template <int S>
-static inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
-    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) ((src[l] >> S) & 3); }
-}
-template <int S, int D, int M>
-static inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
-    for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) (dst[l] | (((src[l] >> S) & M) << D)); }
-}
-#endif
 
 static void tiled_unpack_src0_q4_K(const block_q4_K * rows, int64_t row_stride, int n_rows, tiled_tile_src0_q4_K * tile) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
@@ -354,9 +328,9 @@ static bool ggml_tiled_matmul_forced(void) {
 }
 
 // shape/type gate; anything not supported here runs the old path
-bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
-                                 const struct ggml_tensor * src1,
-                                 const struct ggml_tensor * dst) {
+static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
+                                        const struct ggml_tensor * src1,
+                                        const struct ggml_tensor * dst) {
     if (!ggml_tiled_matmul_enabled()) {
         return false;
     }
@@ -421,8 +395,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
     const int64_t ir0_start,
     const int64_t ir0_end,
     const int64_t ir1_start,
-    const int64_t ir1_end,
-    const tiled_src1_interleave & src1_inter) {
+    const int64_t ir1_end) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -457,8 +430,16 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
 
     const size_t ldc = nb1 / nb0;
 
-    const int8_t * qv = src1_inter.qv;
-    const int64_t nr1_pad = src1_inter.nr1_pad;
+    // pure geometry of the interleave region (see tiled_interleave_geom); the
+    // prepare above built it, this only derives where it sits
+#if defined(KERNEL_SRC1_UNPACK)
+    const tiled_interleave_geom geom = tiled_get_interleave_geom(params, src1, vec_dot_type, ne10, ne11 * ne12 * ne13);
+    const int8_t * qv = geom.qv;
+    const int64_t nr1_pad = geom.nr1_pad;
+#else
+    const int8_t * qv = nullptr;
+    const int64_t nr1_pad = 0;
+#endif
 
     tiled_src0_slot<Fmt> & slot = tiled_get_src0_slot<Fmt>();
     if (!slot.tile) {
@@ -525,9 +506,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
             float * c_curr = (float *) (dst_base + tile_n0 * nb0 + i11 * nb1);
 
             // j-major buffer: zeroed once per macrotile, accumulated over all slabs and
-            // microtiles (each a cheap contiguous add), then transposed into dst once so
-            // every dst element is written exactly once (a per-microtile strided dst RMW
-            // measured ~30% of runtime)
+            // microtiles (each a cheap contiguous add), then written out
             memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
 
             // Compute tiles of length 256 towards our NXN output block
@@ -612,9 +591,10 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
         }
     }
 
-    // interleave the whole tensor's src1 codes once; no-op on non-VNNI builds
-    const tiled_src1_interleave src1_inter = tiled_prepare_src1_interleave(
-        params, src1, vec_dot_type, ne10, ne11 * ne12 * ne13, ith, nth);
+    // interleave the whole tensor's src1 codes once (VNNI builds only)
+#if defined(KERNEL_SRC1_UNPACK)
+    tiled_prepare_src1_interleave(params, src1, vec_dot_type, ne10, ne11 * ne12 * ne13, ith, nth);
+#endif
 
     if (ith == 0) {
         // result is accumulated with += below, so it must start at zero
@@ -642,18 +622,11 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-    // Step down chunk size if too few chunks
+    // Step down chunk size if too few chunks, minimum is microtile size
     while (nchunk0 * nchunk1 < nth * 4 && chunk_size > 16) {
         chunk_size = chunk_size / 2;
         nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-    }
-
-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
     }
 
     // The number of elements in each chunk
@@ -673,8 +646,7 @@ static void ggml_compute_forward_mul_mat_tiled_fmt(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_tiled_one_chunk<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end,
-                                                          src1_inter);
+        ggml_compute_forward_mul_mat_tiled_one_chunk<Fmt>(params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
