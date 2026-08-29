@@ -454,7 +454,7 @@ static_assert(sizeof(block_q8_K) == 292 && offsetof(block_q8_K, qs) == 4,
 // The dpbusd kernel reads the src1 codes in [k/4][row][4], computing 16
 // partial dots.  This code scatters the src1 codes into the region so the
 // tile columns become contiguous loads instead of scattered reads.
-static void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
+void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
                                        int64_t r_start, int64_t r_end,
                                        int64_t n_k, int64_t nr1, int64_t nr1_pad, int8_t * qv) {
 

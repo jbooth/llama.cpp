@@ -600,6 +600,310 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
     }
 }
 
+// ================= mul_mat_id (MoE expert FFN) tiled path =================
+//
+// A separate ladder mirroring the dense one (entry / driver / one_chunk per level):
+//   ggml_compute_forward_mul_mat_id_tiled           entry: gate + quant switch (exported)
+//   ggml_compute_forward_mul_mat_id_tiled_driver    driver: work-stealing over (expert, batch) units (static template)
+//   ggml_compute_forward_mul_mat_id_tiled_one_chunk window: one batch of <= 256 routed rows of one expert (static template)
+//
+// Called from ggml_compute_forward_mul_mat_id after the stock grouping pass:
+// src1 (f32) is already converted to the shared q8_K copy in wdata, and
+// matrix_rows groups the routed rows by expert. Each work unit (expert a,
+// 256-row batch) copies its rows into a per-thread gather buffer, interleaves
+// them (VNNI builds), then runs the window kernel against expert a's weights.
+
+// wdata reservation for the mul_mat_id tiled path: per thread, a gather buffer
+// holding TILED_TILE_ROWS q8_K rows of width ne10, and (VNNI builds only) the
+// local interleave region, k1_pad x TILED_TILE_ROWS bytes (the max batch width).
+// 0 when the master switch is off. Must match the driver's per-thread layout.
+size_t ggml_tiled_mul_mat_id_extra_wdata_len(int64_t ne10, int64_t n_tasks) {
+    if (!ggml_tiled_matmul_enabled()) {
+        return 0;
+    }
+    size_t per_thread = (size_t) TILED_TILE_ROWS * ggml_row_size(GGML_TYPE_Q8_K, ne10);
+    per_thread = GGML_PAD(per_thread, 64);
+#if defined(KERNEL_SRC1_UNPACK)
+    const int64_t k1_pad = (ne10 + 255) & ~255LL;
+    per_thread += (size_t) k1_pad * (size_t) TILED_TILE_ROWS;
+    per_thread = GGML_PAD(per_thread, 64);
+#endif
+    return per_thread * (size_t) n_tasks;
+}
+
+// Per-expert gate: the tiled kernel wins from ~64 routed rows up; below that
+// the stock GEMV is within noise of weight-bandwidth-bound, so those experts
+// stay on the stock chunked path. FORCE (test/bench only) takes the tiled path
+// for any nonzero expert.
+bool ggml_tiled_mul_mat_id_expert_supported(int64_t cne1) {
+    return ggml_tiled_matmul_forced() || cne1 >= 64;
+}
+
+// Writeback of a window whose columns are scattered: column u copies to
+// dst->data + col_off[u], i-major within the column. No register blocking (the
+// dense store has 16x8): the columns are table-indexed, and the store is a
+// small fraction of the runtime at these row counts.
+static void tiled_store_window_mmir(const float * buf, int n_src0, int n_src1, int buf_stride,
+                                    float * dst, const size_t * col_off) {
+    for (int u = 0; u < n_src1; u++) {
+        float * dst_col = (float *) ((char *) dst + col_off[u]);
+        for (int i = 0; i < n_src0; i++) {
+            dst_col[i] = buf[i * buf_stride + u];
+        }
+    }
+}
+
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS>
+static void ggml_compute_forward_mul_mat_id_tiled_one_chunk(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const char * src0_cur,
+    const block_q8_K * src1_rows,
+    const int n_rows,
+    const size_t * col_off,
+    const int8_t * qv,
+    int64_t nr1_pad) {
+
+    UNUSED(params);
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t nb01 = src0->nb[1];
+
+    const size_t src0_bs  = ggml_type_size(src0->type);
+    const int64_t src0_stride = nb01 / src0_bs; // blocks between src0 rows
+    const int64_t src1_stride = ne00 / 256;    // gather rows are contiguous: blocks per row
+
+    GGML_ASSERT(ne00 % 256 == 0);
+    GGML_ASSERT(n_rows >= 1 && n_rows <= TILED_TILE_ROWS);
+
+    if (!tiled_ws.src0) {
+        tiled_ws.src0 = new tiled_tile_src0();
+    }
+    if (!tiled_ws.src1) {
+        tiled_ws.src1 = new tiled_tile_src1();
+    }
+    if (!tiled_ws.acc) {
+        tiled_ws.acc = static_cast<float *>(
+            ::operator new(sizeof(float) * (size_t) TILED_TILE_ROWS * TILED_TILE_ROWS,
+                           std::align_val_t(64)));
+    }
+
+    const int64_t TILE = 256;
+    const int64_t MICRO = 16;
+
+    for (int64_t iir0 = 0; iir0 < ne01; iir0 += TILE) {
+        const int64_t iir0_end = MIN(iir0 + TILE, ne01);
+        const int n_src0 = (int) (iir0_end - iir0);
+
+        memset(tiled_ws.acc, 0, (size_t)TILED_TILE_ROWS * TILED_TILE_ROWS * sizeof(float));
+
+        for (int64_t ib = 0; ib < ne00; ib += TILE) {
+            const int kblk = (int) (ib / TILE);
+            tiled_unpack_src0((const B *) (src0_cur + iir0 * nb01 + kblk * src0_bs), src0_stride, n_src0, tiled_ws.src0);
+            // VNNI reads the codes from the per-batch interleave region, rows 0..nr1_pad;
+            // rows[] feeds the d/bsums copy, row r sits src1_stride blocks from row 0
+            tiled_unpack_src1_q8_K(src1_rows + kblk, src1_stride, n_rows, tiled_ws.src1, qv, nr1_pad, 0, kblk);
+
+            for (int64_t ir0 = iir0; ir0 < iir0_end; ir0 += MICRO) {
+                for (int64_t ir1 = 0; ir1 < n_rows; ir1 += MICRO) {
+                    tiled_run_microtile<SUBBLK, HAS_MIN, BIAS>(*tiled_ws.src0, *tiled_ws.src1,
+                        (int) (ir0 - iir0), (int) ir1,
+                        tiled_ws.acc, TILED_TILE_ROWS);
+                }
+            }
+        }
+        // window base: the dense store gets a dst base that already carries the
+        // iir0 row offset; here the column bases are absolute, so add it per window
+        float * dst_base = (float *) ((char *) dst->data + (size_t) iir0 * dst->nb[0]);
+        tiled_store_window_mmir(tiled_ws.acc, n_src0, n_rows, TILED_TILE_ROWS,
+                                dst_base, col_off);
+    }
+}
+
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS>
+static void ggml_compute_forward_mul_mat_id_tiled_driver(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst,
+        const int32_t * matrix_rows,
+        const int64_t * matrix_row_counts,
+        char * scratch) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int n_as = src0->ne[2];
+    const int64_t pairs_per_expert = ids->ne[0] * ids->ne[1];
+
+    const int64_t ne00 = src0->ne[0];
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_K, ne00); // src1 is f32: the stock q8_K copy exists
+    const size_t rows_per_row = row_size / sizeof(block_q8_K);
+
+    // per-thread scratch, identical layout to ggml_tiled_mul_mat_id_extra_wdata_len:
+    // [gather: TILED_TILE_ROWS contiguous q8_K rows][interleave: k1_pad x TILED_TILE_ROWS, VNNI only]
+    size_t per_thread = GGML_PAD((size_t) TILED_TILE_ROWS * row_size, 64);
+#if defined(KERNEL_SRC1_UNPACK)
+    {
+        const int64_t k1_pad = (ne00 + 255) & ~255LL;
+        per_thread += (size_t) k1_pad * (size_t) TILED_TILE_ROWS;
+        per_thread = GGML_PAD(per_thread, 64);
+    }
+#endif
+    char * my_scratch = scratch + (size_t) ith * per_thread;
+    block_q8_K * gather = (block_q8_K *) my_scratch;
+    int8_t * qv = nullptr;
+#if defined(KERNEL_SRC1_UNPACK)
+    qv = (int8_t *) (my_scratch + GGML_PAD((size_t) TILED_TILE_ROWS * row_size, 64));
+#endif
+
+    // flat unit list over the eligible experts: one unit per 256-row batch
+    int64_t * unit_start = (int64_t *) malloc((n_as + 1) * sizeof(int64_t));
+    unit_start[0] = 0;
+    for (int a = 0; a < n_as; a++) {
+        const int64_t cne1 = matrix_row_counts[a];
+        const int64_t nbatches = ggml_tiled_mul_mat_id_expert_supported(cne1)
+            ? (cne1 + TILED_TILE_ROWS - 1) / TILED_TILE_ROWS : 0;
+        unit_start[a + 1] = unit_start[a] + nbatches;
+    }
+    const int64_t total_units = unit_start[n_as];
+
+    if (total_units > 0) {
+        // all units read the same read-only inputs (after the stock barrier),
+        // so one global counter works; same chunk API as the dense driver
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+        ggml_barrier(params->threadpool);
+
+        int current_unit = ith;
+        while (current_unit < total_units) {
+            // expert of this unit: unit_start is monotone non-decreasing
+            int a = n_as - 1;
+            while (unit_start[a] > current_unit) a--;
+            const int64_t cne1 = matrix_row_counts[a];
+            const int64_t batch = current_unit - unit_start[a];
+            const int64_t r0 = batch * TILED_TILE_ROWS;
+            const int n_rows = (int) MIN((int64_t) TILED_TILE_ROWS, cne1 - r0);
+
+            // flat pair stride: the stock layout is [n_as][pairs_per_expert] mmid_row_mapping,
+            // 2 int32_t per mapping
+            const int32_t * rows_a = matrix_rows + (size_t) a * pairs_per_expert * 2;
+            const char * src0_cur = (const char *) src0->data + (size_t) a * src0->nb[2];
+
+            // 1. gather the batch's q8_K rows from the stock's shared copy;
+            // row (slot % ne11) + token * ne11, as in the stock one_chunk
+            const block_q8_K * wdata_rows = (const block_q8_K *) params->wdata;
+            const int64_t ne11 = src1->ne[1];
+            for (int u = 0; u < n_rows; u++) {
+                const int32_t slot  = rows_a[(r0 + u) * 2 + 0];
+                const int32_t token = rows_a[(r0 + u) * 2 + 1];
+                const size_t wrow = (size_t) (slot % ne11) + (size_t) token * (size_t) ne11;
+                const block_q8_K * src = &wdata_rows[wrow * rows_per_row];
+                // rows are rows_per_row q8_K blocks wide, not 1 block:
+                // the interleave and the d/bsums copy both index rows at that stride
+                memcpy((char *) gather + (size_t) u * row_size, src, row_size);
+            }
+
+            // 2. interleave into this thread's local region (VNNI builds only);
+            // the masked lanes zero the padded tail. row_stride = rows_per_row: each
+            // gathered row is ne00/256 q8_K blocks wide (only 1 when ne00 == 256)
+#if defined(KERNEL_SRC1_UNPACK)
+            const int64_t nr1_pad = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
+            tiled_interleave_src1_q8_K(gather, rows_per_row, 0, nr1_pad, ne00, n_rows, nr1_pad, qv);
+#else
+            const int64_t nr1_pad = 0;
+#endif
+
+            // 3. dst column bases (absolute byte offsets, table-indexed store)
+            size_t col_off[TILED_TILE_ROWS];
+            for (int u = 0; u < n_rows; u++) {
+                const int32_t slot  = rows_a[(r0 + u) * 2 + 0];
+                const int32_t token = rows_a[(r0 + u) * 2 + 1];
+                col_off[u] = (size_t) slot * (size_t) dst->nb[1] + (size_t) token * (size_t) dst->nb[2];
+            }
+
+            // 4. the [K, n_rows] GEMM
+            ggml_compute_forward_mul_mat_id_tiled_one_chunk<B, SUBBLK, HAS_MIN, BIAS>(
+                params, dst, src0_cur, gather, n_rows, col_off, qv, nr1_pad);
+
+            if (nth >= total_units) {
+                break;
+            }
+            current_unit = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+    }
+    free(unit_start);
+}
+
+// tiled mul_mat_id entry; same role and shape as ggml_compute_forward_mul_mat_tiled.
+// Called by all threads of the op, after the stock barrier.
+bool ggml_compute_forward_mul_mat_id_tiled(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst,
+        const int32_t * matrix_rows,
+        const int64_t * matrix_row_counts,
+        char * scratch) {
+    if (params->use_ref) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    if (!ggml_tiled_matmul_enabled()) {
+        return false;
+    }
+    // repack-buffer weights keep their own kernel
+    if (src0->extra != NULL) {
+        return false;
+    }
+    // src1 f32 only: the stock op only supports f32, and it guarantees the
+    // shared q8_K conversion copy the gather reads from
+    if (src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // K-quant weights only for now
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q2_K) {
+        return false;
+    }
+    // the reduction dim is not guaranteed by the quant format for this op's
+    // tensor shape: reject unsupported shapes cleanly rather than abort
+    if (src0->ne[0] % 256 != 0) {
+        return false;
+    }
+    // src0 rows contiguous (the stock op asserts this too)
+    if (src0->nb[0] != ggml_type_size(src0->type)) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q6_K:
+            ggml_compute_forward_mul_mat_id_tiled_driver<block_q6_K, 16, false, 32>(params, dst, matrix_rows, matrix_row_counts, scratch);
+            break;
+        case GGML_TYPE_Q5_K:
+            ggml_compute_forward_mul_mat_id_tiled_driver<block_q5_K, 32, true,  0>(params, dst, matrix_rows, matrix_row_counts, scratch);
+            break;
+        case GGML_TYPE_Q4_K:
+            ggml_compute_forward_mul_mat_id_tiled_driver<block_q4_K, 32, true,  0>(params, dst, matrix_rows, matrix_row_counts, scratch);
+            break;
+        case GGML_TYPE_Q3_K:
+            ggml_compute_forward_mul_mat_id_tiled_driver<block_q3_K, 16, false,  4>(params, dst, matrix_rows, matrix_row_counts, scratch);
+            break;
+        case GGML_TYPE_Q2_K:
+            ggml_compute_forward_mul_mat_id_tiled_driver<block_q2_K, 16, true,  0>(params, dst, matrix_rows, matrix_row_counts, scratch);
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
 bool ggml_compute_forward_mul_mat_tiled(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {

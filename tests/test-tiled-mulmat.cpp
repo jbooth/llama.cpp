@@ -200,6 +200,84 @@ static void test_matmul_highdim(ggml_backend_t backend, int64_t M, int64_t N, in
     free(src1_ref); free(src0_ref); free(dst_std); free(dst_tiled);
 }
 
+static void gen_mmid_ids(int32_t * ids, int64_t M, int64_t k, int64_t E) {
+    for (int64_t m = 0; m < M; m++) {
+        for (int64_t j = 0; j < k; j++) {
+            ids[m * k + j] = (int32_t) ((m * k + j) % E);
+        }
+    }
+}
+
+// mul_mat_id harness: src0 = [N, K, E] K-quant weights, src1 = [N, 1, M] f32,
+// ids = [k, M] i32, dst = [K, k, M]. Column (slot j, token m) is the GEMV of
+// row m against expert ids[m][j].
+static void test_mul_mat_id(ggml_backend_t backend, int64_t N, int64_t K, int64_t E, int64_t M, int64_t k, ggml_type quant_type) {
+    srand(0xBEEF);
+
+    float * src1_ref = gen_rand_f32(N * M);
+    float * src0_ref = gen_rand_f32(N * K * E);
+    int32_t * ids_data = (int32_t *) malloc(k * M * sizeof(int32_t));
+    gen_mmid_ids(ids_data, M, k, E);
+    // dst = [K, k, M] f32 (see ggml_mul_mat_id: ne = {as->ne[1], ids->ne[0], b->ne[2]})
+    float * dst_out   = (float *) malloc(K * k * M * sizeof(float));
+    float * dst_tiled = (float *) malloc(K * k * M * sizeof(float));
+
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    int64_t ne_src0[4] = { N, K, E, 1 };
+    int64_t ne_src1[4] = { N, 1, M, 1 };
+    int64_t ne_ids[4]  = { k, M, 1, 1 };
+    struct ggml_tensor * src1 = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne_src1);
+    struct ggml_tensor * src0 = ggml_new_tensor(ctx, quant_type,  3, ne_src0);
+    struct ggml_tensor * ids  = ggml_new_tensor(ctx, GGML_TYPE_I32,  2, ne_ids);
+
+    struct ggml_cgraph * gf  = ggml_new_graph(ctx);
+    struct ggml_tensor * dst   = ggml_mul_mat_id(ctx, src0, src1, ids);
+    ggml_build_forward_expand(gf, dst);
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    fill_tensor(src1, src1_ref, M, N, GGML_TYPE_F32);
+    fill_tensor(src0, src0_ref, K * E, N, quant_type);
+    ggml_backend_tensor_set(ids, ids_data, 0, ggml_nbytes(ids));
+
+    // stock (use_ref) vs hook path, as in test_matmul
+    ggml_backend_cpu_set_use_ref(backend, true);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, dst_out, 0, ggml_nbytes(dst));
+    ggml_backend_cpu_set_use_ref(backend, false);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, dst_tiled, 0, ggml_nbytes(dst));
+
+    float max_err, rms_err;
+    compare_f32(dst_out, dst_tiled, K * k * M, &max_err, &rms_err);
+    float tol = 1e-3f;
+
+    printf("TEST mmid %lldx%lldx%lld * %lldx%lldx%lld ids[%lld,%lld] (%s): %s (max_err: %f, rms: %f, tolerance: %f)\n",
+           (long long)N, (long long)K, (long long)E, (long long)N, (long long)1, (long long)M,
+           (long long)k, (long long)M,
+           ggml_type_name(quant_type), (max_err <= tol) ? "PASS" : "FAIL", max_err, rms_err, tol);
+
+    // dump a few offenders if the tiled path deviates beyond quantization tolerance
+    if (max_err > tol) {
+        int64_t shown = 0;
+        for (int64_t i = 0; i < K * k * M && shown < 8; ++i) {
+            float err = fabsf(dst_out[i] - dst_tiled[i]);
+            if (err > tol) {
+                printf("  tiled vs std: i=%lld (i0=%lld i1=%lld i2=%lld) std=%f tiled=%f err=%f\n",
+                       (long long)i, (long long)(i % K), (long long)((i / K) % k), (long long)(i / (K * k)),
+                       dst_out[i], dst_tiled[i], err);
+                ++shown;
+            }
+        }
+        ++n_failed;
+    }
+
+    ggml_free(ctx);
+    free(src1_ref); free(src0_ref); free(ids_data); free(dst_out); free(dst_tiled);
+}
+
 static double time_graph_compute(ggml_backend_t backend, struct ggml_cgraph * gf) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -363,6 +441,129 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
     }
 }
 
+struct bench_mmid_row {
+    const char * name;
+    double time_std, time_repack, time_tiled;
+    float max_err_repack, rmse_repack;
+    float max_err_tiled, rmse_tiled;
+    bool have_repack;
+};
+
+static bench_mmid_row bench_mmid(ggml_backend_t backend, int64_t N, int64_t K, int64_t E, int64_t M, int64_t k, ggml_type quant_type) {
+    bench_mmid_row row;
+    row.name = ggml_type_name(quant_type);
+    row.time_std = row.time_repack = row.time_tiled = 0.0;
+    row.max_err_repack = row.rmse_repack = row.max_err_tiled = row.rmse_tiled = 0.0f;
+    row.have_repack = false;
+
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    int64_t ne_src0[4] = { N, K, E, 1 };
+    int64_t ne_src1[4] = { N, 1, M, 1 };
+    int64_t ne_ids[4]  = { k, M, 1, 1 };
+    struct ggml_tensor * src1     = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne_src1);
+    struct ggml_tensor * src0_std = ggml_new_tensor(ctx, quant_type,  3, ne_src0);
+    struct ggml_tensor * src0_rep = ggml_new_tensor(ctx, quant_type,  3, ne_src0);
+    struct ggml_tensor * ids      = ggml_new_tensor(ctx, GGML_TYPE_I32,  2, ne_ids);
+
+    // std and tiled are the same op on the same tensors; one graph serves
+    // both timings (use_ref selects the stock path)
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_tensor * dst = ggml_mul_mat_id(ctx, src0_std, src1, ids);
+    ggml_build_forward_expand(gf, dst);
+
+    struct ggml_cgraph * gf_repack = ggml_new_graph(ctx);
+    struct ggml_tensor * dst_repack  = ggml_mul_mat_id(ctx, src0_rep, src1, ids);
+    ggml_build_forward_expand(gf_repack, dst_repack);
+
+    ggml_backend_buffer_type_t repack_buft = get_cpu_repack_buft();
+    if (repack_buft && N % 8 == 0 && K % 8 == 0) {
+        ggml_backend_buffer_t buf_rep = ggml_backend_buft_alloc_buffer(repack_buft, ggml_nbytes(src0_rep));
+        src0_rep->buffer = buf_rep;
+        src0_rep->data   = ggml_backend_buffer_get_base(buf_rep);
+        ggml_backend_buffer_init_tensor(buf_rep, src0_rep);
+        row.have_repack = (src0_rep->extra != NULL);
+    }
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    srand(0xBEEF);
+    float * src1_data = gen_rand_f32(N * M);
+    float * src0_data = gen_rand_f32(N * K * E);
+    int32_t * ids_data = (int32_t *) malloc(k * M * sizeof(int32_t));
+    gen_mmid_ids(ids_data, M, k, E);
+    fill_tensor(src1, src1_data, M, N, GGML_TYPE_F32);
+    fill_tensor(src0_std, src0_data, K * E, N, quant_type);
+    if (row.have_repack) {
+        fill_tensor(src0_rep, src0_data, K * E, N, quant_type);
+    }
+    ggml_backend_tensor_set(ids, ids_data, 0, ggml_nbytes(ids));
+    free(src1_data); free(src0_data); free(ids_data);
+
+    const size_t flush_size = 256 * 1024 * 1024;
+    void * flush_buf = malloc(flush_size);
+    const int n_reps = 5;
+    ggml_backend_cpu_set_use_ref(backend, true);
+    row.time_std    = time_graph_compute_best(backend, gf, n_reps, flush_buf, flush_size);
+    ggml_backend_cpu_set_use_ref(backend, false);
+    if (row.have_repack) {
+        row.time_repack = time_graph_compute_best(backend, gf_repack, n_reps, flush_buf, flush_size);
+    }
+    row.time_tiled  = time_graph_compute_best(backend, gf, n_reps, flush_buf, flush_size);
+    free(flush_buf);
+
+    // errors vs the standard output (all paths use the same quantized weights)
+    float * out_std    = (float *) malloc(K * k * M * sizeof(float));
+    float * out_tiled  = (float *) malloc(K * k * M * sizeof(float));
+    float * out_repack = (float *) malloc(K * k * M * sizeof(float));
+    ggml_backend_cpu_set_use_ref(backend, true);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, out_std, 0, ggml_nbytes(dst));
+    ggml_backend_cpu_set_use_ref(backend, false);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(dst, out_tiled, 0, ggml_nbytes(dst));
+    if (row.have_repack) {
+        ggml_backend_graph_compute(backend, gf_repack);
+        ggml_backend_tensor_get(dst_repack, out_repack, 0, ggml_nbytes(dst_repack));
+        compare_f32(out_std, out_repack, K * k * M, &row.max_err_repack, &row.rmse_repack);
+    }
+    compare_f32(out_std, out_tiled, K * k * M, &row.max_err_tiled, &row.rmse_tiled);
+    free(out_std); free(out_tiled); free(out_repack);
+
+    ggml_free(ctx);
+    return row;
+}
+
+static void print_bench_table_mmid(int64_t N, int64_t K, int64_t E, int64_t M, int64_t k, const bench_mmid_row * rows, size_t n_types) {
+    const double flops = 2.0 * M * k * K * N;
+
+    printf("\nBENCH mmid src0[%lldx%lldx%lld] src1[%lldx1x%lld] ids[%lldx%lld] cne1~%lld, min of 5 timings, 8 threads\n",
+           (long long)N, (long long)K, (long long)E, (long long)N, (long long)M, (long long)k, (long long)M,
+           (long long) (k * M / E));
+    printf("%-8s %10s %12s %12s %11s %11s %17s %17s %17s %17s\n",
+           "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
+           "max_err(repack)", "rmse(repack)", "max_err(tiled)", "rmse(tiled)");
+    for (size_t i = 0; i < n_types; ++i) {
+        const bench_mmid_row * r = &rows[i];
+        if (r->have_repack) {
+            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %17.5e %17.5e %17.5e %17.5e\n",
+                   r->name,
+                   flops / (r->time_std * 1e12),
+                   flops / (r->time_repack * 1e12), flops / (r->time_tiled * 1e12),
+                   r->time_std / r->time_repack, r->time_std / r->time_tiled,
+                   r->max_err_repack, r->rmse_repack, r->max_err_tiled, r->rmse_tiled);
+        } else {
+            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %17s %17s %17.5e %17.5e\n",
+                   r->name,
+                   flops / (r->time_std * 1e12),
+                   "n/a", flops / (r->time_tiled * 1e12), "n/a",
+                   r->time_std / r->time_tiled,
+                   "n/a", "n/a", r->max_err_tiled, r->rmse_tiled);
+        }
+    }
+}
+
 int main() {
     // Enable tiled MM, also force tiled MM even when unprofitable for benchmarks
     setenv("GGML_CPU_TILED_MM", "1", 1);
@@ -432,17 +633,26 @@ int main() {
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q3_K); // 4D, tiled, q3_K
     test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q2_K); // 4D, tiled, q2_K
 
+    // mul_mat_id: deterministic near-uniform routing, cne1 = k*M/E
+    test_mul_mat_id(backend, 256,  256,   2,  64,  8, GGML_TYPE_Q4_K); // N = K = 256: single-block gather rows
+    test_mul_mat_id(backend, 1024, 4096, 128, 2048, 8, GGML_TYPE_Q4_K); // cne1 = 128
+    test_mul_mat_id(backend, 1024, 4096, 128, 2048, 8, GGML_TYPE_Q6_K); // cne1 = 128
+    test_mul_mat_id(backend, 1024, 4096, 128, 100,  8, GGML_TYPE_Q4_K); // ragged cne1 = 6/7
+    test_mul_mat_id(backend, 1024, 4096, 32,  2048, 4, GGML_TYPE_Q4_K); // cne1 = 256
+    test_mul_mat_id(backend, 1024, 257,  128, 1,    8, GGML_TYPE_Q4_K); // decode cne1=1, ragged K (256+1 windows)
+    test_mul_mat_id(backend, 960,  4096, 128, 256,  8, GGML_TYPE_Q4_K); // N % 256 != 0: gate rejects
+
     // benchmarks, one timing per quant type and shape; the table compares standard,
     // repack and tiled, with max error / RMSE vs the standard output
     const ggml_type bench_types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
     const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
     struct { int64_t M, N, K; } shapes[] = {
-        { 8192, 8192, 8192 },
-        { 4096, 4096, 4096 },
+        // big shapes, commented out for iteration speed
+        //{ 8192, 8192, 8192 },
+        //{ 4096, 4096, 4096 },
         { 4096, 4096,   64 },
         { 4096, 4096,   32 },
         { 4096, 4096,   16 },
-        //{ 4096, 4096,   8 },
         { 4096, 4096,   1 },
     };
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
@@ -451,6 +661,22 @@ int main() {
             rows[i] = bench_three_way(backend, shapes[s].M, shapes[s].N, shapes[s].K, bench_types[i]);
         }
         print_bench_table(shapes[s].M, shapes[s].N, shapes[s].K, rows, n_types);
+    }
+
+    // mul_mat_id benchmarks; (E, k, M) pairs give the average cne1 = k*M/E
+    // E = 128, k = 8, M = 256 -> cne1 = 16; below the per-expert gate, run here only because the harness forces tiled
+    struct { int64_t E, k, M; } mmid_shapes[] = {
+        { 128, 8,  2048 },
+        { 128, 8,  8192 },
+        {  32, 4,  2048 },
+        { 128, 8,   256 },
+    };
+    for (size_t s = 0; s < sizeof(mmid_shapes) / sizeof(mmid_shapes[0]); ++s) {
+        bench_mmid_row rows[n_types];
+        for (size_t i = 0; i < n_types; ++i) {
+            rows[i] = bench_mmid(backend, 1024, 4096, mmid_shapes[s].E, mmid_shapes[s].M, mmid_shapes[s].k, bench_types[i]);
+        }
+        print_bench_table_mmid(1024, 4096, mmid_shapes[s].E, mmid_shapes[s].M, mmid_shapes[s].k, rows, n_types);
     }
 
     ggml_backend_free(backend);

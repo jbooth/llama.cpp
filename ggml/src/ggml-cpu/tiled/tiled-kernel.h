@@ -95,6 +95,15 @@ template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride);
 
+// Scatters the q8 codes of a contiguous batch of rows into a local
+// [slab][k/4][row][4] region (VNNI builds only, see the driver of the mul_mat_id
+// tiled path, which interleaves per batch instead of the whole tensor)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+void tiled_interleave_src1_q8_K(const block_q8_K * rows, int64_t row_stride,
+                                int64_t r_start, int64_t r_end,
+                                int64_t n_k, int64_t nr1, int64_t nr1_pad, int8_t * qv);
+#endif
+
 
 // Defined when this arch's kernel reads the src1 tile codes in a non-natural order.
 // If set, driver will call kernel methods `tiled_prepare_src1_interleave` and 

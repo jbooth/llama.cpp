@@ -1649,10 +1649,21 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // tiled path for the eligible experts (cne1 >= 64, or forced); wdata_cur is
+    // the base of the per-thread scratch reserved after the items above. All
+    // threads call it, the return gates the skip below
+    const bool tiled_done = ggml_compute_forward_mul_mat_id_tiled(
+        params, dst, (const int32_t *) matrix_rows, matrix_row_counts, (char *) wdata_cur);
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // handled by the tiled path above; same per-expert gate as the driver's unit list
+        if (tiled_done && ggml_tiled_mul_mat_id_expert_supported(cne1)) {
             continue;
         }
 
@@ -2885,6 +2896,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // extra reservation for the tiled mul_mat_id path, if any
+                        // (per-thread gather + interleave scratch; 0 when disabled)
+                        cur += ggml_tiled_mul_mat_id_extra_wdata_len(src0->ne[0], n_tasks);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
