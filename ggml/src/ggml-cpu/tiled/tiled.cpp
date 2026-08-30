@@ -288,6 +288,10 @@ size_t ggml_tiled_extra_wdata_len(int64_t ne10, int64_t nr1) {
 // compatibility/profitability gate.  anything not supported here will fall back to the vec_dot path
 static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
                                         const struct ggml_tensor * src1) {
+
+#if !defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)
+    return false;
+#else
     if (!ggml_tiled_matmul_enabled()) {
         return false;
     }
@@ -322,6 +326,7 @@ static bool ggml_tiled_matmul_supported(const struct ggml_tensor * src0,
         return false;
     }
     return true;
+#endif
 }
 
 // Writeback of the 256x256 window: buf is j-major (row stride buf_stride),
