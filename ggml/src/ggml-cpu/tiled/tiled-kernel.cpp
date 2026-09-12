@@ -61,7 +61,7 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
     // Apply d and write out to buf
     for (int i = 0; i < TILED_MICRO; i++) {
         for (int j = 0; j < TILED_MICRO; j++) {
-            buf[(i0 + i) * buf_stride + (j0 + j)] += src1.d[j0 + j] * acc[i][j];
+            buf[(j0 + j) * buf_stride + (i0 + i)] += src1.d[j0 + j] * acc[i][j];
         }
     }
 }
@@ -117,7 +117,7 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
             }
         }
 
-        // int correction: src1 is always biased +128, so raw' = dot(s1+128, true_src0) = dot(s1, true_src0) + 128*src0_bsums
+        // int correction: raw' = dot(s1+128, src0) = dot(s1, src0) + 128*src0_bsums
         // s1_acc += scales * (raw' - 128*src0_bsums)
         const __m512i scales_16 = _mm512_load_si512((const __m512i *) &src0.scales_t[s * TILED_TILE_ROWS + i0]);
         for (int t = 0; t < NUM_COLS; t++) {
@@ -141,23 +141,24 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
         }
     }
 
-    // epilogue: scalar stores (16 src0 rows x 8 src1 cols)
-    for (int t = 0; t < NUM_COLS; t++) {
-        const float d1 = src1.d[j0 + t];
-        alignas(64) int32_t s1v[TILED_MICRO];
-        alignas(64) int32_t s2v[TILED_MICRO];
-        _mm512_store_si512((__m512i *) s1v, s1_acc[t]);
-        if constexpr (HAS_MIN) {
-            _mm512_store_si512((__m512i *) s2v, s2_acc[t]);
+    // epilogue: buf is [col][row], so each col's 16 rows are contiguous (64B store)
+    const __m512 d0_vec = _mm512_load_ps(&src0.d[i0]);
+    if constexpr (HAS_MIN) {
+        const __m512 dmin_vec = _mm512_load_ps(&src0.dmin[i0]);
+        for (int t = 0; t < NUM_COLS; t++) {
+            __m512 f1 = _mm512_cvtepi32_ps(s1_acc[t]);
+            __m512 result = _mm512_mul_ps(f1, d0_vec);
+            __m512 f2 = _mm512_cvtepi32_ps(s2_acc[t]);
+            result = _mm512_fnmadd_ps(dmin_vec, f2, result);
+            float * p = &buf[(j0 + t) * buf_stride + i0];
+            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[j0 + t]))));
         }
-        for (int i = 0; i < TILED_MICRO; i++) {
-            const int ar = i0 + i;
-            float result = (float) s1v[i] * src0.d[ar];
-            if constexpr (HAS_MIN) {
-                result -= (float) s2v[i] * src0.dmin[ar];
-            }
-            float * p = &buf[ar * buf_stride + (j0 + t)];
-            *p += result * d1;
+    } else {
+        for (int t = 0; t < NUM_COLS; t++) {
+            __m512 f1 = _mm512_cvtepi32_ps(s1_acc[t]);
+            __m512 result = _mm512_mul_ps(f1, d0_vec);
+            float * p = &buf[(j0 + t) * buf_stride + i0];
+            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[j0 + t]))));
         }
     }
 }
@@ -314,14 +315,13 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
 #endif
             }
 
-            float * buf_ptr = &buf[ar * buf_stride + j0 + g];
-            __m256 current_buf = _mm256_loadu_ps(buf_ptr);
-#if defined(__FMA__)
-            __m256 updated_buf = _mm256_fmadd_ps(res_vec, src1_d_vec, current_buf);
-#else
-            __m256 updated_buf = _mm256_add_ps(current_buf, _mm256_mul_ps(res_vec, src1_d_vec));
-#endif
-            _mm256_storeu_ps(buf_ptr, updated_buf);
+            // [col][row] buf: 8 cols for 1 row are not contiguous, store individually
+            alignas(32) float res_vals[8];
+            _mm256_storeu_ps(res_vals, _mm256_mul_ps(res_vec, src1_d_vec));
+            #pragma GCC unroll 8
+            for (int t = 0; t < GROUP; t++) {
+                buf[(j0 + g + t) * buf_stride + ar] += res_vals[t];
+            }
         }
     }
 }
@@ -401,7 +401,7 @@ static void tiled_run_microtile_avx(const tiled_tile_src0 & src0, const tiled_ti
                 if constexpr (HAS_MIN) {
                     res -= dmin0 * (float) s2_s[t];
                 }
-                buf[ar * buf_stride + j0 + g + t] += src1.d[j0 + g + t] * res;
+                buf[(j0 + g + t) * buf_stride + ar] += src1.d[j0 + g + t] * res;
             }
         }
     }

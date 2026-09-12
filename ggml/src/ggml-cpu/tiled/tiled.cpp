@@ -612,9 +612,9 @@ static void tiled_store_window(const float * buf, int n_src0, int n_src1, int bu
         int rj = 0;
         for (; rj + 8 <= n_src1; rj += 8) {
             float r[16][8];
-            for (int t = 0; t < 16; t++) {
-                for (int u = 0; u < 8; u++) {
-                    r[t][u] = buf[(ri + t) * buf_stride + rj + u];
+            for (int u = 0; u < 8; u++) {
+                for (int t = 0; t < 16; t++) {
+                    r[t][u] = buf[(rj + u) * buf_stride + ri + t];
                 }
             }
             for (int u = 0; u < 8; u++) {
@@ -626,14 +626,14 @@ static void tiled_store_window(const float * buf, int n_src0, int n_src1, int bu
         // ragged j tail
         for (; rj < n_src1; rj++) {
             for (int t = 0; t < 16; t++) {
-                dst[(ri + t) + (size_t) rj * dst_stride] = buf[(ri + t) * buf_stride + rj];
+                dst[(ri + t) + (size_t) rj * dst_stride] = buf[rj * buf_stride + ri + t];
             }
         }
     }
     // ragged i tail
     for (; ri < n_src0; ri++) {
         for (int j = 0; j < n_src1; j++) {
-            dst[ri + (size_t) j * dst_stride] = buf[ri * buf_stride + j];
+            dst[ri + (size_t) j * dst_stride] = buf[j * buf_stride + ri];
         }
     }
 }
@@ -656,9 +656,9 @@ static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1
         int rj = 0;
         for (; rj + 8 <= n_src1; rj += 8) {
             float r[16][8];
-            for (int t = 0; t < 16; t++) {
-                for (int u = 0; u < 8; u++) {
-                    r[t][u] = buf[(ri + t) * buf_stride + rj + u];
+            for (int u = 0; u < 8; u++) {
+                for (int t = 0; t < 16; t++) {
+                    r[t][u] = buf[(rj + u) * buf_stride + ri + t];
                 }
             }
             for (int u = 0; u < 8; u++) {
@@ -670,14 +670,14 @@ static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1
         // ragged j tail
         for (; rj < n_src1; rj++) {
             for (int t = 0; t < 16; t++) {
-                col_ptrs[rj][ri + t] = buf[(ri + t) * buf_stride + rj];
+                col_ptrs[rj][ri + t] = buf[rj * buf_stride + ri + t];
             }
         }
     }
     // ragged i tail
     for (; ri < n_src0; ri++) {
         for (int j = 0; j < n_src1; j++) {
-            col_ptrs[j][ri] = buf[ri * buf_stride + j];
+            col_ptrs[j][ri] = buf[j * buf_stride + ri];
         }
     }
 }
@@ -701,8 +701,8 @@ static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_t
     const int64_t src0_stride = src0->nb[1] / src0_bs;
 
     // the window is at most TILED_MMID_GROUP x TILED_TILE_K, so zero only that region of acc
-    for (int64_t i = 0; i < n_src0; i++) {
-        memset(&ws->acc[i * TILED_TILE_ROWS], 0, nrows * sizeof(float));
+    for (int64_t j = 0; j < nrows; j++) {
+        memset(&ws->acc[j * TILED_TILE_ROWS], 0, n_src0 * sizeof(float));
     }
 
     // scattered writeback: column m goes to its routed dst row; r * nb[0] is the window row offset
