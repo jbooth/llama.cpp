@@ -444,22 +444,25 @@ static void tiled_unpack_src0(const block_iq1_m * rows, int64_t row_stride, int 
     }
 }
 
-// unpack src1 tile from q8_K rows
+// unpack src1 tile from q8_K rows: store (s1 + 128) as uint8 for maddubs/dpbusd A operand
 static void tiled_unpack_src1_q8_K(const block_q8_K * const * rows, int n_rows, tiled_tile_src1 * tile,
                                    int kblk) {
     GGML_ASSERT(n_rows <= TILED_TILE_ROWS);
     const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
-    // natural [row][k] fill, zero-pad ragged tail
+    const __m256i bias = _mm256_set1_epi8(128);
     for (int r = 0; r < n_padded; r++) {
+        uint8_t * dst = &tile->q[r * TILED_TILE_K];
         if (r < n_rows) {
-            memcpy(&tile->q[r * TILED_TILE_K], rows[r][kblk].qs, TILED_TILE_K);
+            const uint8_t * src = (const uint8_t *) rows[r][kblk].qs;
+            for (int e = 0; e < TILED_TILE_K; e += 32) {
+                _mm256_storeu_si256((__m256i *) (dst + e),
+                    _mm256_add_epi8(_mm256_loadu_si256((const __m256i *) (src + e)), bias));
+            }
         } else {
-            memset(&tile->q[r * TILED_TILE_K], 0, TILED_TILE_K);
+            memset(dst, 0x80, TILED_TILE_K);
         }
     }
-    // ISA-specific interleave (in-place, no-op on non-VNNI)
-    tiled_repack_src1_codes(tile);
-    // d and bsums (ISA-independent)
+    // d and bsums (ISA-independent, true s1 values)
     for (int r = 0; r < n_padded; r++) {
         if (r < n_rows) {
             const block_q8_K & x = rows[r][kblk];
@@ -470,6 +473,36 @@ static void tiled_unpack_src1_q8_K(const block_q8_K * const * rows, int n_rows, 
             tile->d[r] = 0.0f;
         }
     }
+}
+
+// src0 post-pass: subtract BIAS, compute bsums, interleave for VNNI
+template <int BIAS>
+static void tiled_postprocess_src0(tiled_tile_src0 * tile, int n_rows, int nb) {
+    const int n_padded = (n_rows + TILED_MICRO - 1) & ~(TILED_MICRO - 1);
+
+    if constexpr (BIAS != 0) {
+        const __m256i bias = _mm256_set1_epi8((int8_t) BIAS);
+        for (int r = 0; r < n_padded; r++) {
+            uint8_t * q = (uint8_t *) &tile->q[r * TILED_TILE_K];
+            for (int e = 0; e < TILED_TILE_K; e += 32) {
+                _mm256_storeu_si256((__m256i *) (q + e),
+                    _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *) (q + e)), bias));
+            }
+        }
+    }
+
+    // compute bsums: [s * ROWS + row], s = 0..15 (per 16-k group)
+    for (int r = 0; r < n_padded; r++) {
+        const int8_t * q = (const int8_t *) &tile->q[r * TILED_TILE_K];
+        for (int s = 0; s < TILED_TILE_K / 16; s++) {
+            int32_t sum = 0;
+            for (int e = 0; e < 16; e++) { sum += (int32_t) q[s * 16 + e]; }
+            tile->bsums[s * TILED_TILE_ROWS + r] = sum;
+        }
+    }
+
+    // ISA-specific: transpose scales/mins + interleave codes (no-op on non-VNNI)
+    tiled_repack_src0(tile, nb);
 }
 
 // GGML_CPU_TILED_MM: master switch, on by default. If off, we fast return false and normal vec_dot mul_mat resumes
@@ -683,6 +716,7 @@ static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_t
     for (int64_t ib = 0; ib < ne00; ib += TILED_TILE_K) {
         const int kblk = (int) (ib / TILED_TILE_K);
         tiled_unpack_src0((const B *) (src0_cur + r * src0->nb[1] + kblk * src0_bs), src0_stride, n_src0, &ws->src0);
+        tiled_postprocess_src0<BIAS>(&ws->src0, n_src0, TILED_TILE_K / SUBBLK);
         tiled_unpack_src1_q8_K(rows, nrows, &ws->src1, kblk);
         // 16x16 microtiles sweeping the window; the unpack routines zeropad the
         // macrotiles outside the valid ranges, so the ragged tails are harmless
@@ -844,6 +878,7 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
                 // Unpack src0 and src1 into macrotiles
                 const int kblk = (int) (ib / TILE);
                 tiled_unpack_src0((const B *) (src0_row + iir0 * nb01 + kblk * src0_bs), src0_stride, n_src0, &ws->src0);
+                tiled_postprocess_src0<BIAS>(&ws->src0, n_src0, TILED_TILE_K / SUBBLK);
                 tiled_unpack_src1_q8_K(rows, n_src1, &ws->src1, kblk);
 
                 // 16x16 microtiles sweeping the window

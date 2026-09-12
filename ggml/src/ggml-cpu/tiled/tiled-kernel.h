@@ -27,17 +27,24 @@
 struct tiled_tile_src0 {
     static constexpr int NB_MAX = TILED_TILE_K / 16; // max subblocks per 256-elem block
 
-    alignas(32) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; // unsigned quants, widened to uint8
+    alignas(32) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K]; // raw codes (pre-BIAS-subtraction); kernel reads as int8
     float    d[TILED_TILE_ROWS];  // One d from each input block, widened to f32
     float    dmin[TILED_TILE_ROWS]; // dmin from each input block (if applicable), widened to F32
-    int32_t   scales[TILED_TILE_ROWS * NB_MAX];  // per-subblock scale, stored as int32_t
-    int32_t   mins[TILED_TILE_ROWS * NB_MAX];    // per-subblock min, used when HAS_MIN
+    // scales/mins: [row * NB + s] (for AVX2/AVX/scalar kernels)
+    int32_t   scales[TILED_TILE_ROWS * NB_MAX];
+    int32_t   mins[TILED_TILE_ROWS * NB_MAX];
+    // transposed: [s * ROWS + row] (for VNNI kernel, 512-bit load + mullo)
+    int32_t   scales_t[TILED_TILE_ROWS * NB_MAX];
+    int32_t   mins_t[TILED_TILE_ROWS * NB_MAX];
+    // bsums: [s * ROWS + row] (512-bit load in kernel)
+    int32_t   bsums[TILED_TILE_ROWS * NB_MAX];
 };
 
 // src1 tile: built from q8_K (wdata)
 struct tiled_tile_src1 {
-    // q8 codes, one byte per element. Note for VNNI these are reshaped + transposed to be suitable for dpbusd.
-    alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];
+    // q8 codes, one byte per element, stored as (s1 + 128) for clean uint8 interpretation.
+    // For VNNI these are reshaped + transposed to be suitable for dpbusd.
+    alignas(64) uint8_t q[TILED_TILE_ROWS * TILED_TILE_K];
     // per-16 code sums from q8_k (int16), widened to int32 so the kernels load them directly, no per-use cvt
     alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
     // f32 (not f16): q8_k stores fp16, the unpack converts once
@@ -143,9 +150,9 @@ template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, float * buf, int buf_stride);
 
-// Interleave the natural [row][256] src1 codes in-place into the VNNI
+// Interleave the natural [row][256] src0 codes in-place into the VNNI
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.
-void tiled_repack_src1_codes(tiled_tile_src1 * tile);
+void tiled_repack_src0(tiled_tile_src0 * tile, int nb);
 
 // Interleave one 16-row x 64-k chunk of src1 q8 codes into the VNNI [g][row][4] layout.
 // rows[r] points to the qs field (256 bytes) of row r's block_q8_K at the desired kblk.
