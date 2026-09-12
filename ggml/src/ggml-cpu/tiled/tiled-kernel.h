@@ -21,6 +21,11 @@
 #define TILED_TILE_ROWS 256 // max window rows, ragged at edges
 #define TILED_MICRO     16  // microtile edge (also the bsums code-sum granularity)
 
+// set to 1 to use on-the-fly interleave (no pre-repack of codes)
+#ifndef TILED_NO_FLY
+#define TILED_NO_FLY 0
+#endif
+
 // src0 tile: weight side, shared by all formats.
 // scales/mins are sized for the max subblock count (SUBBLK=16);
 // SUBBLK=32 formats index at stride 8 and leave the slack unused.
@@ -153,6 +158,10 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
 // Interleave the natural [row][256] src0 codes in-place into the VNNI
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.
 void tiled_repack_src0(tiled_tile_src0 * tile, int nb);
+
+// No-fly variant: only transposes scales/mins, skips code interleave.
+// Used when TILED_NO_FLY=1 (kernel does interleave on-the-fly).
+void tiled_repack_src0_nofly(tiled_tile_src0 * tile, int nb);
 
 // Interleave one 16-row x 64-k chunk of src1 q8 codes into the VNNI [g][row][4] layout.
 // rows[r] points to the qs field (256 bytes) of row r's block_q8_K at the desired kblk.

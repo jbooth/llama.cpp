@@ -502,7 +502,11 @@ static void tiled_postprocess_src0(tiled_tile_src0 * tile, int n_rows, int nb) {
     }
 
     // ISA-specific: transpose scales/mins + interleave codes (no-op on non-VNNI)
+#if TILED_NO_FLY
+    tiled_repack_src0_nofly(tile, nb);
+#else
     tiled_repack_src0(tile, nb);
+#endif
 }
 
 // GGML_CPU_TILED_MM: master switch, on by default. If off, we fast return false and normal vec_dot mul_mat resumes
