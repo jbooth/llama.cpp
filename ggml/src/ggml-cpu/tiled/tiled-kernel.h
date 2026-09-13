@@ -153,7 +153,7 @@ inline void tiled_unpk_tern8(const uint8_t * src, int8_t delta, uint8_t * dst) {
 // SUBBLK/HAS_MIN/BIAS are the src0 format constants (see tiled_tile_src0).
 template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
-                         int i0, int j0, float * buf, int buf_stride);
+                         int i0, int j0, int n_cols, float * buf, int buf_stride);
 
 // Interleave the natural [row][256] src0 codes in-place into the VNNI
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.

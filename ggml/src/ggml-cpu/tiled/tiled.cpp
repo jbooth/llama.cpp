@@ -726,8 +726,11 @@ static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_t
         // macrotiles outside the valid ranges, so the ragged tails are harmless
         for (int64_t ir0 = r; ir0 < r_end; ir0 += TILED_MICRO) {
             for (int64_t ir1 = 0; ir1 < nrows; ir1 += TILED_MICRO) {
+                // valid cols in this 16-wide window: the loop steps by TILED_MICRO, but
+                // nrows - ir1 spans to the end of all valid rows, so clamp to the tile width
+                const int n_cols = (int) MIN(TILED_MICRO, nrows - ir1);
                 tiled_run_microtile<SUBBLK, HAS_MIN, BIAS>(ws->src0, ws->src1,
-                    (int) (ir0 - r), (int) ir1,
+                    (int) (ir0 - r), (int) ir1, n_cols,
                     ws->acc, TILED_TILE_ROWS);
             }
         }
@@ -888,8 +891,11 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
                 // 16x16 microtiles sweeping the window
                 for (int64_t ir0 = iir0; ir0 < iir0_end; ir0 += MICRO) {
                     for (int64_t ir1 = iir1; ir1 < iir1_end; ir1 += MICRO) {
+                        // valid cols in this 16-wide microtile window (the loop steps by MICRO,
+                        // but iir1_end - ir1 spans to the window end, so clamp to the tile width)
+                        const int n_cols = (int) MIN(TILED_MICRO, iir1_end - ir1);
                         tiled_run_microtile<SUBBLK, HAS_MIN, BIAS>(ws->src0, ws->src1,
-                            (int) (ir0 - iir0), (int) (ir1 - iir1),
+                            (int) (ir0 - iir0), (int) (ir1 - iir1), n_cols,
                             ws->acc, TILED_TILE_ROWS);
                     }
                 }
