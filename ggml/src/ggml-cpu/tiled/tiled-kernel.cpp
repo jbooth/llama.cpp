@@ -615,6 +615,41 @@ void tiled_repack_src0(tiled_tile_src0 * tile, int nb) {
 }
 #endif
 
+// per-group repack: transpose + interleave one 16-row group
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb) {
+    const int r0 = grp * TILED_MICRO;
+    // transpose scales/mins for this group
+    for (int s = 0; s < nb; s++) {
+        for (int r = r0; r < r0 + TILED_MICRO; r++) {
+            tile->scales_t[s * TILED_TILE_ROWS + r] = tile->scales[r * nb + s];
+            tile->mins_t[s * TILED_TILE_ROWS + r] = tile->mins[r * nb + s];
+        }
+    }
+#if !TILED_NO_FLY
+    // interleave codes for this group
+    alignas(64) uint8_t grp_src[TILED_MICRO * TILED_TILE_K];
+    alignas(64) uint8_t grp_dst[1024];
+    const int8_t * rp[TILED_MICRO];
+    for (int r = 0; r < TILED_MICRO; r++) {
+        rp[r] = (const int8_t *) &grp_src[r * TILED_TILE_K];
+    }
+    uint8_t * base = (uint8_t *) &tile->q[r0 * TILED_TILE_K];
+    memcpy(grp_src, base, TILED_MICRO * TILED_TILE_K);
+    for (int c = 0; c < 4; c++) {
+        tiled_repack_16x16(rp, c, grp_dst);
+        memcpy(base + c * 1024, grp_dst, 1024);
+    }
+#endif
+}
+#else
+void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb) {
+    GGML_UNUSED(tile);
+    GGML_UNUSED(grp);
+    GGML_UNUSED(nb);
+}
+#endif
+
 // no-fly repack: only transpose scales/mins, skip code interleave
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
 void tiled_repack_src0_nofly(tiled_tile_src0 * tile, int nb) {

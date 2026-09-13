@@ -159,6 +159,10 @@ void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & s
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.
 void tiled_repack_src0(tiled_tile_src0 * tile, int nb);
 
+// Per-group variant: transpose + interleave one 16-row group.
+// Used for GEMV just-in-time repack to minimize L1 dirty footprint.
+void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb);
+
 // No-fly variant: only transposes scales/mins, skips code interleave.
 // Used when TILED_NO_FLY=1 (kernel does interleave on-the-fly).
 void tiled_repack_src0_nofly(tiled_tile_src0 * tile, int nb);
