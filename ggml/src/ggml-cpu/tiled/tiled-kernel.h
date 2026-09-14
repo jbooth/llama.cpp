@@ -21,6 +21,9 @@
 #define TILED_TILE_K    256 // one QK_K block
 #define TILED_TILE_ROWS 256 // max window rows, ragged at edges
 #define TILED_MICRO     16  // microtile edge (also the bsums code-sum granularity)
+// extended-K tile: 16 rows x K_full reinterpreting the fixed q byte budget; K_full is
+// capped so 16 * K_full <= TILED_TILE_ROWS * TILED_TILE_K (the q field size)
+#define TILED_EXT_MAX_K (TILED_TILE_ROWS * TILED_TILE_K) / TILED_MICRO   // = 4096
 
 // src0 tile: weight side, shared by all formats.
 // scales/mins are sized for the max subblock count (SUBBLK=16);
@@ -166,6 +169,15 @@ inline bool tiled_kernel_accelerated(void) {
 #endif
 }
 
+// the extended-K (16 x K_full) small-nrows path is VNNI-only for now
+inline bool tiled_kernel_ext_available(void) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // Accumulate one 16x16 microtile (src0 rows [i0, i0+16), src1 cols [j0, j0+16))
 // over the full 256-K slab held in the tiles into a j-major float buffer
 // (row width buf_stride): buf[i*buf_stride + j] += partial.
@@ -173,6 +185,24 @@ inline bool tiled_kernel_accelerated(void) {
 template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, int n_cols, float * buf, int buf_stride);
+
+// Extended-K MAC: same 16x16 microtile, but the tiles hold 16 rows x K_full (row stride
+// k_extent) instead of a 256-K slab. One call covers one 256-K slab at slab_offset
+// (0..K_full/256-1). i0 is the tile row (0 for the extended 16-row tile); i0_buf is the
+// acc row (the driver's window row offset). table_stride is the transposed side-table
+// row stride (TILED_MICRO = 16 for the extended tile). VNNI only.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_microtile_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                             int i0, int j0, int n_cols, float * buf, int buf_stride,
+                             int k_extent, int slab_offset, int table_stride, int i0_buf);
+
+// GEMV (Driver C): 1 activation col x 16 weight rows on the extended tile. j0 is the col
+// index (0 for the single real col); i0_buf is the acc row (the driver's window row offset).
+// Same ext-tile geometry as tiled_run_microtile_ext; one call covers one 256-K slab. VNNI only.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_gemv_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                        int j0, float * buf, int buf_stride,
+                        int k_extent, int slab_offset, int table_stride, int i0_buf);
 
 // Interleave the natural [row][256] src0 codes in-place into the VNNI
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.
@@ -182,9 +212,16 @@ void tiled_repack_src0(tiled_tile_src0 * tile, int nb);
 // Used for GEMV just-in-time repack to minimize L1 dirty footprint.
 void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb);
 
+// Per-group extended repack: transpose scales/mins to [s_full * TILED_MICRO + row] for the
+// 16 rows (s_full spans the full K), and interleave the codes over all K_full/64 chunks at
+// row stride k_extent. nb = k_extent / SUBBLK (subblocks across the full K, the scales
+// row-major stride).
+void tiled_repack_src0_ext(tiled_tile_src0 * tile, int k_extent, int nb);
+
 // Interleave one 16-row x 64-k chunk of src1 q8 codes into the VNNI [g][row][4] layout.
 // rows[r] points to the qs field (256 bytes) of row r's block_q8_K at the desired kblk.
 // c selects the chunk (0..3) within the 64-int32 qs field (int32s [c*16, c*16+16)).
 // out receives 1024 bytes in [k-group][row][4] layout (dpbusd-ready).
-void tiled_repack_16x16(uint8_t * base, int c);
+// row stride of the 16 rows is k_extent (TILED_TILE_K for the normal 256-K slab).
+void tiled_repack_16x16(uint8_t * base, int c, int k_extent);
 

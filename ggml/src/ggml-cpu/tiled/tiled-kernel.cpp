@@ -79,7 +79,8 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
 // the broadcast is one src1 col at a time. acc16[t] has 16 lanes (one per src0 row).
 template <int SUBBLK, bool HAS_MIN, int BIAS, bool FULL, int COLS = 8>
 static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
-                                       int i0, int j0, int n_cols, float * buf, int buf_stride) {
+                                       int i0, int j0, int n_cols, float * buf, int buf_stride,
+                                       int k_extent, int slab_offset, int table_stride, int i0_buf) {
     constexpr int NB = TILED_TILE_K / SUBBLK;
     constexpr int NS = SUBBLK / 16;
     constexpr int NG = SUBBLK / 4;
@@ -91,6 +92,12 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
     // dpbusd t-chain stays fully unrolled; the ragged/GEMV path (n_cols < 8) uses the runtime
     // bound to skip work on the zero-padded cols
     const int tmax = FULL ? NUM_COLS : n_cols;
+
+    // extended-K geometry: k_extent is the q row stride (TILED_TILE_K for the normal 256-K
+    // slab), slab_offset selects the 256-K slab within the full-K tile, table_stride is the
+    // transposed side-table row stride, i0_buf is the acc row (i0 for the normal path)
+    const int s16_base = slab_offset * (TILED_TILE_K / 16); // per-16-k group base across the full K
+    const int d_base   = slab_offset * TILED_MICRO;         // d/dmin row base (slab * 16 rows)
 
     __m512i s1_acc[NUM_COLS];
     for (int t = 0; t < tmax; t++) { s1_acc[t] = _mm512_setzero_si512(); }
@@ -106,22 +113,23 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
         __m512i acc16[NUM_COLS];
         for (int t = 0; t < tmax; t++) { acc16[t] = _mm512_setzero_si512(); }
         // 512-bit load of src0 bsums for 16 rows, combined over NS groups per subblock
-        __m512i src0_bsums_16 = _mm512_load_si512((const __m512i *) &src0.bsums[s * NS * TILED_TILE_ROWS + i0]);
+        __m512i src0_bsums_16 = _mm512_load_si512((const __m512i *) &src0.bsums[(s16_base + s * NS) * table_stride + i0]);
         for (int u = 1; u < NS; u++) {
-            src0_bsums_16 = _mm512_add_epi32(src0_bsums_16, _mm512_load_si512((const __m512i *) &src0.bsums[(s * NS + u) * TILED_TILE_ROWS + i0]));
+            src0_bsums_16 = _mm512_add_epi32(src0_bsums_16, _mm512_load_si512((const __m512i *) &src0.bsums[(s16_base + s * NS + u) * table_stride + i0]));
         }
         __m512i bias_16 = _mm512_mullo_epi32(src0_bsums_16, _mm512_set1_epi32(128));
 
         for (int g = 0; g < NG; g++) {
             const int kg = s * NG + g;
             // 512-bit load: 16 src0 rows x 4 k, interleaved layout
-            // in-place transpose layout: group-local, row = kg%16, chunk c = kg/16
-            const __m512i src0_512 = _mm512_load_si512((const __m512i *) &src0.q[(i0 / TILED_MICRO) * (TILED_MICRO * TILED_TILE_K)
-                                                                              + (kg % TILED_MICRO) * TILED_TILE_K
-                                                                              + (kg / TILED_MICRO) * (TILED_MICRO * 4)]);
+            // in-place transpose layout: group-local, row = kg%16, chunk c = kg/16; the chunk
+            // index is offset by the slab (c_full = slab * 4 + kg/16) and the row stride is k_extent
+            const int grp_base = (i0 / TILED_MICRO) * (TILED_MICRO * k_extent);
+            const int c_full   = slab_offset * (TILED_TILE_K / (TILED_MICRO * 4)) + (kg / TILED_MICRO);
+            const __m512i src0_512 = _mm512_load_si512((const __m512i *) &src0.q[grp_base + (kg % TILED_MICRO) * k_extent + c_full * (TILED_MICRO * 4)]);
             // broadcast: one src1 col's 4 k-values (biased s1+128, uint8)
             for (int t = 0; t < tmax; t++) {
-                const uint32_t s1_u4 = *(const uint32_t *) &src1.q[(j0 + t) * TILED_TILE_K + kg * 4];
+                const uint32_t s1_u4 = *(const uint32_t *) &src1.q[(j0 + t) * k_extent + slab_offset * TILED_TILE_K + kg * 4];
                 const __m512i s1_bcast = _mm512_set1_epi32((int) s1_u4);
                 acc16[t] = _mm512_dpbusd_epi32(acc16[t], s1_bcast, src0_512);
             }
@@ -129,7 +137,8 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
 
         // int correction: raw' = dot(s1+128, src0) = dot(s1, src0) + 128*src0_bsums
         // s1_acc += scales * (raw' - 128*src0_bsums)
-        const __m512i scales_16 = _mm512_load_si512((const __m512i *) &src0.scales_t[s * TILED_TILE_ROWS + i0]);
+        const int s_full = slab_offset * NB + s; // subblock index across the full K
+        const __m512i scales_16 = _mm512_load_si512((const __m512i *) &src0.scales_t[s_full * table_stride + i0]);
         for (int t = 0; t < tmax; t++) {
             s1_acc[t] = _mm512_add_epi32(s1_acc[t], _mm512_mullo_epi32(_mm512_sub_epi32(acc16[t], bias_16), scales_16));
         }
@@ -141,10 +150,11 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
             int32_t s1_bsums[NUM_COLS];
             for (int t = 0; t < tmax; t++) {
                 int32_t sum = 0;
-                for (int u = 0; u < NS; u++) { sum += src1.bsums[(s * NS + u) * TILED_TILE_ROWS + j0 + t]; }
+                for (int u = 0; u < NS; u++) { sum += src1.bsums[(s16_base + s * NS + u) * table_stride + j0 + t]; }
                 s1_bsums[t] = sum;
             }
-            const __m512i mins_16 = _mm512_load_si512((const __m512i *) &src0.mins_t[s * TILED_TILE_ROWS + i0]);
+            const int s_full = slab_offset * NB + s;
+            const __m512i mins_16 = _mm512_load_si512((const __m512i *) &src0.mins_t[s_full * table_stride + i0]);
             for (int t = 0; t < tmax; t++) {
                 s2_acc[t] = _mm512_add_epi32(s2_acc[t], _mm512_mullo_epi32(mins_16, _mm512_set1_epi32(s1_bsums[t])));
             }
@@ -152,23 +162,23 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
     }
 
     // epilogue: buf is [col][row], so each col's 16 rows are contiguous (64B store)
-    const __m512 d0_vec = _mm512_load_ps(&src0.d[i0]);
+    const __m512 d0_vec = _mm512_load_ps(&src0.d[d_base + i0]);
     if constexpr (HAS_MIN) {
-        const __m512 dmin_vec = _mm512_load_ps(&src0.dmin[i0]);
+        const __m512 dmin_vec = _mm512_load_ps(&src0.dmin[d_base + i0]);
         for (int t = 0; t < tmax; t++) {
             __m512 f1 = _mm512_cvtepi32_ps(s1_acc[t]);
             __m512 result = _mm512_mul_ps(f1, d0_vec);
             __m512 f2 = _mm512_cvtepi32_ps(s2_acc[t]);
             result = _mm512_fnmadd_ps(dmin_vec, f2, result);
-            float * p = &buf[(j0 + t) * buf_stride + i0];
-            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[j0 + t]))));
+            float * p = &buf[(j0 + t) * buf_stride + i0_buf];
+            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[d_base + j0 + t]))));
         }
     } else {
         for (int t = 0; t < tmax; t++) {
             __m512 f1 = _mm512_cvtepi32_ps(s1_acc[t]);
             __m512 result = _mm512_mul_ps(f1, d0_vec);
-            float * p = &buf[(j0 + t) * buf_stride + i0];
-            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[j0 + t]))));
+            float * p = &buf[(j0 + t) * buf_stride + i0_buf];
+            _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[d_base + j0 + t]))));
         }
     }
 }
@@ -176,16 +186,97 @@ static void tiled_run_micro_vnni_16x8(const tiled_tile_src0 & src0, const tiled_
 // 16x16 microtile split into 16xCOLS passes over src1 cols j0..j0+15
 template <int SUBBLK, bool HAS_MIN, int BIAS>
 static void tiled_run_microtile_vnni(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
-                                         int i0, int j0, int n_cols, float * buf, int buf_stride) {
+                                         int i0, int j0, int n_cols, float * buf, int buf_stride,
+                                         int k_extent, int slab_offset, int table_stride, int i0_buf) {
     // SUBBLK=32 uses 4-col passes: at 8 cols GCC emits a home/active register ping-pong
     // for the dpbusd accumulators (35-39% vec-copy); 4 cols keeps them in dedicated regs.
     // SUBBLK=16 stays at 8 cols (already clean; 4 cols would 4x the per-kg src0 loads).
     constexpr int COLS = (SUBBLK == 32) ? 4 : 8;
     for (int c = 0; c < n_cols; c += COLS) {
         const int nc = COLS < (n_cols - c) ? COLS : (n_cols - c);
-        if (nc == COLS) tiled_run_micro_vnni_16x8<SUBBLK, HAS_MIN, BIAS, true , COLS>(src0, src1, i0, j0 + c, nc, buf, buf_stride);
-        else            tiled_run_micro_vnni_16x8<SUBBLK, HAS_MIN, BIAS, false, COLS>(src0, src1, i0, j0 + c, nc, buf, buf_stride);
+        if (nc == COLS) tiled_run_micro_vnni_16x8<SUBBLK, HAS_MIN, BIAS, true , COLS>(src0, src1, i0, j0 + c, nc, buf, buf_stride, k_extent, slab_offset, table_stride, i0_buf);
+        else            tiled_run_micro_vnni_16x8<SUBBLK, HAS_MIN, BIAS, false, COLS>(src0, src1, i0, j0 + c, nc, buf, buf_stride, k_extent, slab_offset, table_stride, i0_buf);
     }
+}
+
+// GEMV: 1 activation col x 16 weight rows (Driver C). Same extended-tile geometry and
+// addressing as the ext MAC (k_extent, slab_offset, table_stride, i0_buf), one call covers
+// one 256-K slab. The ILP unit is the k-group WITHIN a subblock (NG independent dpbusd,
+// one per 4-k group), not the col: the 16x16 MAC's ILP is the col (acc16[t]), so at n_cols=1
+// its g-loop is a serial dpbusd chain. Here acc[g] is per k-group, so the g-loop is NG
+// independent dpbusd, then a reduction to the full subblock dot product (one per src0 row).
+// The per-subblock scale correction is applied after the reduction (it cannot be factored
+// out across k-groups because the scale is shared, so the raw int sum must complete first).
+// Bit-identical to the per-slab path: the per-subblock, per-slab accumulation order matches;
+// the int reduction is exact.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_gemv_vnni(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                int j0, float * buf, int buf_stride,
+                                int k_extent, int slab_offset, int table_stride, int i0_buf) {
+    constexpr int NB = TILED_TILE_K / SUBBLK;   // subblocks per 256-K slab
+    constexpr int NS = SUBBLK / 16;            // per-16 bsums per subblock
+    constexpr int NG = SUBBLK / 4;             // k-groups (4-k) per subblock
+
+    // ext tile geometry (same as the ext MAC): the 16 weight rows sit at tile rows 0..15
+    // (i0 = 0); i0_buf is the acc row offset (the driver's window row offset)
+    const int s16_base = slab_offset * (TILED_TILE_K / 16); // per-16-k group base across the chunk
+    const int d_base   = slab_offset * TILED_MICRO;         // d/dmin row base (slab * 16 rows)
+
+    __m512i s1_acc = _mm512_setzero_si512();
+    __m512i s2_acc = _mm512_setzero_si512();
+
+    for (int s = 0; s < NB; s++) {
+        // NG k-group accumulators (the ILP): one dpbusd each, independent across g
+        __m512i acc[NG];
+        for (int g = 0; g < NG; g++) { acc[g] = _mm512_setzero_si512(); }
+
+        // src0 bsums for the 16 rows at each subblock, combined over the NS per-16 groups
+        __m512i src0_bsums_16 = _mm512_load_si512((const __m512i *) &src0.bsums[(s16_base + s * NS) * table_stride + 0]);
+        for (int u = 1; u < NS; u++) {
+            src0_bsums_16 = _mm512_add_epi32(src0_bsums_16, _mm512_load_si512((const __m512i *) &src0.bsums[(s16_base + s * NS + u) * table_stride + 0]));
+        }
+        __m512i bias_16 = _mm512_mullo_epi32(src0_bsums_16, _mm512_set1_epi32(128));
+
+        for (int g = 0; g < NG; g++) {
+            const int kg = s * NG + g;
+            // ext src0 code layout: [kg%16 row][c_full chunk], row stride k_extent (i0 = 0)
+            const int c_full   = slab_offset * (TILED_TILE_K / (TILED_MICRO * 4)) + (kg / TILED_MICRO);
+            const __m512i src0_512 = _mm512_load_si512((const __m512i *) &src0.q[(kg % TILED_MICRO) * k_extent + c_full * (TILED_MICRO * 4)]);
+            // one col's 4 k-values (biased s1+128, uint8); broadcast across the 16 rows
+            const uint32_t s1_u4 = *(const uint32_t *) &src1.q[j0 * k_extent + slab_offset * TILED_TILE_K + kg * 4];
+            const __m512i s1_bcast = _mm512_set1_epi32((int) s1_u4);
+            acc[g] = _mm512_dpbusd_epi32(acc[g], s1_bcast, src0_512);
+        }
+
+        // reduce the NG k-groups to the full subblock dot product (one per src0 row)
+        __m512i acc0 = acc[0];
+        for (int g = 1; g < NG; g++) { acc0 = _mm512_add_epi32(acc0, acc[g]); }
+
+        // int correction: raw' = dot(s1+128, src0); s1_acc += scales * (raw' - 128*src0_bsums)
+        const int s_full = slab_offset * NB + s; // subblock index across the chunk
+        const __m512i scales_16 = _mm512_load_si512((const __m512i *) &src0.scales_t[s_full * table_stride + 0]);
+        s1_acc = _mm512_add_epi32(s1_acc, _mm512_mullo_epi32(_mm512_sub_epi32(acc0, bias_16), scales_16));
+
+        if constexpr (HAS_MIN) {
+            // src1 bsums for the single col (a scalar), combined over the NS per-16 groups
+            int32_t sum = 0;
+            for (int u = 0; u < NS; u++) { sum += src1.bsums[(s16_base + s * NS + u) * table_stride + j0]; }
+            const __m512i mins_16 = _mm512_load_si512((const __m512i *) &src0.mins_t[s_full * table_stride + 0]);
+            s2_acc = _mm512_add_epi32(s2_acc, _mm512_mullo_epi32(mins_16, _mm512_set1_epi32(sum)));
+        }
+    }
+
+    // epilogue: 16 outputs (one per src0 row); buf is [col][row], the 16 rows are contiguous
+    const __m512 d0_vec = _mm512_load_ps(&src0.d[d_base + 0]);
+    __m512 f1 = _mm512_cvtepi32_ps(s1_acc);
+    __m512 result = _mm512_mul_ps(f1, d0_vec);
+    if constexpr (HAS_MIN) {
+        const __m512 dmin_vec = _mm512_load_ps(&src0.dmin[d_base + 0]);
+        __m512 f2 = _mm512_cvtepi32_ps(s2_acc);
+        result = _mm512_fnmadd_ps(dmin_vec, f2, result);
+    }
+    float * p = &buf[j0 * buf_stride + i0_buf];
+    _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[d_base + j0]))));
 }
 
 #endif // __AVX512VNNI__ && __AVX512VL__
@@ -439,13 +530,48 @@ template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, int n_cols, float * buf, int buf_stride) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-    tiled_run_microtile_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride);
+    // normal 256-K slab geometry: k_extent = TILED_TILE_K, slab_offset = 0, the transposed
+    // side-table stride is TILED_TILE_ROWS, and the acc row equals the tile row (i0_buf = i0)
+    tiled_run_microtile_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride,
+                                                    TILED_TILE_K, 0, TILED_TILE_ROWS, i0);
 #elif defined(__AVX2__)
     tiled_run_microtile_avx2<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride);
 #elif defined(__AVX__)
     tiled_run_microtile_avx<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride);
 #else
     tiled_run_microtile_scalar<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride);
+#endif
+}
+
+// extended-K microtile entry point (16 x K_full tile, one 256-K slab per call). VNNI only;
+// the driver gates on tiled_kernel_ext_available() before calling.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_microtile_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                             int i0, int j0, int n_cols, float * buf, int buf_stride,
+                             int k_extent, int slab_offset, int table_stride, int i0_buf) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    tiled_run_microtile_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, i0, j0, n_cols, buf, buf_stride,
+                                                    k_extent, slab_offset, table_stride, i0_buf);
+#else
+    GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(i0); GGML_UNUSED(j0); GGML_UNUSED(n_cols);
+    GGML_UNUSED(buf); GGML_UNUSED(buf_stride); GGML_UNUSED(k_extent); GGML_UNUSED(slab_offset);
+    GGML_UNUSED(table_stride); GGML_UNUSED(i0_buf);
+#endif
+}
+
+// GEMV (1 activation col x 16 weight rows) entry point on the extended tile. j0 is the col
+// index (0 for the single real col). VNNI only; the driver gates on
+// tiled_kernel_ext_available() before calling.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_gemv_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                        int j0, float * buf, int buf_stride,
+                        int k_extent, int slab_offset, int table_stride, int i0_buf) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    tiled_run_gemv_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, j0, buf, buf_stride,
+                                               k_extent, slab_offset, table_stride, i0_buf);
+#else
+    GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(j0); GGML_UNUSED(buf); GGML_UNUSED(buf_stride);
+    GGML_UNUSED(k_extent); GGML_UNUSED(slab_offset); GGML_UNUSED(table_stride); GGML_UNUSED(i0_buf);
 #endif
 }
 
@@ -463,6 +589,30 @@ template void tiled_run_microtile<16, false, 4>(const tiled_tile_src0 & src0, co
                                                 int i0, int j0, int n_cols, float * buf, int buf_stride);
 template void tiled_run_microtile<16, true, 0>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, int n_cols, float * buf, int buf_stride);
+
+// extended-K entry point, same format set
+#define TILED_EXT_INST(SB, HM, BI) \
+    template void tiled_run_microtile_ext<SB, HM, BI>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1, \
+        int i0, int j0, int n_cols, float * buf, int buf_stride, int k_extent, int slab_offset, int table_stride, int i0_buf);
+TILED_EXT_INST(32, true , 0)
+TILED_EXT_INST(32, false, 128)
+TILED_EXT_INST(16, false, 128)
+TILED_EXT_INST(16, false, 32)
+TILED_EXT_INST(16, false, 4)
+TILED_EXT_INST(16, true , 0)
+#undef TILED_EXT_INST
+
+// GEMV (1 col x 16 rows), same format set
+#define TILED_GEMV_INST(SB, HM, BI) \
+    template void tiled_run_gemv_ext<SB, HM, BI>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1, \
+        int j0, float * buf, int buf_stride, int k_extent, int slab_offset, int table_stride, int i0_buf);
+TILED_GEMV_INST(32, true , 0)
+TILED_GEMV_INST(32, false, 128)
+TILED_GEMV_INST(16, false, 128)
+TILED_GEMV_INST(16, false, 32)
+TILED_GEMV_INST(16, false, 4)
+TILED_GEMV_INST(16, true , 0)
+#undef TILED_GEMV_INST
 
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -489,7 +639,7 @@ void tiled_repack_src0(tiled_tile_src0 * tile, int nb) {
     for (int grp = 0; grp < TILED_TILE_ROWS / TILED_MICRO; grp++) {
         uint8_t * base = (uint8_t *) &tile->q[grp * (TILED_MICRO * TILED_TILE_K)];
         for (int c = 0; c < 4; c++) {
-            tiled_repack_16x16(base, c);
+            tiled_repack_16x16(base, c, TILED_TILE_K);
         }
     }
 }
@@ -514,13 +664,37 @@ void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb) {
     // interleave codes for this group (in-place)
     uint8_t * base = (uint8_t *) &tile->q[r0 * TILED_TILE_K];
     for (int c = 0; c < 4; c++) {
-        tiled_repack_16x16(base, c);
+        tiled_repack_16x16(base, c, TILED_TILE_K);
     }
 }
 #else
 void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb) {
     GGML_UNUSED(tile);
     GGML_UNUSED(grp);
+    GGML_UNUSED(nb);
+}
+#endif
+
+// extended repack: one 16-row group holding the full K (row stride k_extent). The scales/
+// mins transpose to [s_full * TILED_MICRO + row] (the 16-row stride), the codes interleave
+// over all k_extent/64 chunks. VNNI only (the extended path is VNNI-only).
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+void tiled_repack_src0_ext(tiled_tile_src0 * tile, int k_extent, int nb) {
+    for (int s = 0; s < nb; s++) {
+        for (int r = 0; r < TILED_MICRO; r++) {
+            tile->scales_t[s * TILED_MICRO + r] = tile->scales[r * nb + s];
+            tile->mins_t[s * TILED_MICRO + r] = tile->mins[r * nb + s];
+        }
+    }
+    uint8_t * base = (uint8_t *) &tile->q[0];
+    for (int c = 0; c < k_extent / (TILED_MICRO * 4); c++) {
+        tiled_repack_16x16(base, c, k_extent);
+    }
+}
+#else
+void tiled_repack_src0_ext(tiled_tile_src0 * tile, int k_extent, int nb) {
+    GGML_UNUSED(tile);
+    GGML_UNUSED(k_extent);
     GGML_UNUSED(nb);
 }
 #endif
@@ -532,10 +706,10 @@ void tiled_repack_src0_group(tiled_tile_src0 * tile, int grp, int nb) {
 // kernel reads the 16 rows' k-group (kg%16) as one 512-bit vector at
 // base + (kg%16)*256 + (kg/16)*64. All 16 loads retire before any store, so it is safe.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
-void tiled_repack_16x16(uint8_t * base, int c) {
+void tiled_repack_16x16(uint8_t * base, int c, int k_extent) {
     __m512i v[16];
     for (int r = 0; r < 16; r++) {
-        v[r] = _mm512_load_si512((const __m512i *) (base + r * TILED_TILE_K + c * (TILED_MICRO * 4)));
+        v[r] = _mm512_load_si512((const __m512i *) (base + r * k_extent + c * (TILED_MICRO * 4)));
     }
 
     // 16x16 int32 transpose, 4 butterfly phases
@@ -589,22 +763,22 @@ void tiled_repack_16x16(uint8_t * base, int c) {
     // in-place: write back to the same chunk-c slice of row col_order[g]
     static const int col_order[16] = {0, 8, 1, 9, 4, 12, 5, 13, 2, 10, 3, 11, 6, 14, 7, 15};
     for (int g = 0; g < 16; g++) {
-        _mm512_store_si512((void *) (base + col_order[g] * TILED_TILE_K + c * (TILED_MICRO * 4)), v[g]);
+        _mm512_store_si512((void *) (base + col_order[g] * k_extent + c * (TILED_MICRO * 4)), v[g]);
     }
 }
 #else
-void tiled_repack_16x16(uint8_t * base, int c) {
+void tiled_repack_16x16(uint8_t * base, int c, int k_extent) {
     // scalar: transpose the 16x16 int32 tile (dead path on non-VNNI; kept correct via temp)
     alignas(64) uint8_t tmp[TILED_MICRO * TILED_MICRO * 4];
     for (int r = 0; r < 16; r++) {
         for (int g = 0; g < 16; g++) {
-            const uint8_t * s = base + r * TILED_TILE_K + c * (TILED_MICRO * 4) + g * 4;
+            const uint8_t * s = base + r * k_extent + c * (TILED_MICRO * 4) + g * 4;
             uint8_t * p = tmp + g * 64 + r * 4;
             memcpy(p, s, 4);
         }
     }
     for (int g = 0; g < 16; g++) {
-        memcpy(base + g * TILED_TILE_K + c * (TILED_MICRO * 4), tmp + g * 64, 64);
+        memcpy(base + g * k_extent + c * (TILED_MICRO * 4), tmp + g * 64, 64);
     }
 }
 #endif
