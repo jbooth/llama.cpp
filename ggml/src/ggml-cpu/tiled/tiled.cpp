@@ -476,6 +476,37 @@ static void tiled_unpack_src1_q8_K(const block_q8_K * const * rows, int n_rows, 
     }
 }
 
+// dequant one weight row (full K) into the compact sliding-GEMV layout, one 256-block at a
+// time, using the per-quant block dequant. Quant-specific (B = the weight type); the generic
+// tiled_run_gemv_int8 MAC reads the dequantized codes. NB = subblocks per 256-block.
+template <typename B, int NB>
+static void decode_slide_src0(const B * row, int k, tiled_slide_w * w) {
+    GGML_ASSERT(k <= TILED_EXT_MAX_K && k % QK_K == 0);
+    const int nb = k / QK_K;
+    for (int b = 0; b < nb; b++) {
+        tiled_unpack_one_block(row[b], (uint8_t *) w->code + b * QK_K,
+                               w->scales + b * NB, w->mins + b * NB,
+                               &w->d[b], &w->dmin[b]);
+    }
+}
+
+// decode the single activation row (q8_K) into the compact sliding-GEMV buffer: the raw
+// int8 codes (the maddubs signed operand), the per-32 code sums (derived from the block's
+// per-16 bsums, for the min term), and the per-block scale. k is a multiple of QK_K and
+// <= TILED_EXT_MAX_K (the GEMV gate).
+static void decode_slide_src1(const block_q8_K * row, int k, tiled_slide_s1 * s) {
+    GGML_ASSERT(k <= TILED_EXT_MAX_K && k % QK_K == 0);
+    const int nb = k / QK_K;
+    for (int b = 0; b < nb; b++) {
+        const block_q8_K & x = row[b];
+        s->d[b] = x.d;
+        memcpy(s->code + b * QK_K, x.qs, QK_K);
+        for (int t = 0; t < QK_K / 32; t++) {
+            s->bsums32[b * (QK_K / 32) + t] = (int16_t) (x.bsums[2*t] + x.bsums[2*t + 1]);
+        }
+    }
+}
+
 // src0 post-pass: subtract BIAS, compute bsums, interleave for VNNI
 template <int BIAS>
 static void tiled_postprocess_src0(tiled_tile_src0 * tile, int n_rows, int nb) {
@@ -570,6 +601,31 @@ static bool ggml_tiled_noext(void) {
         noext = env != NULL && atoi(env) == 1;
     });
     return noext;
+}
+
+// GGML_CPU_TILED_MM_GEMVL1: test/bench only, use the L1-resident GEMV (Driver C v2) for
+// M=1 / cne1=1: src1 unpacked once and L1-resident, src0 in 16 x 1024 windows
+static bool ggml_tiled_gemv_l1(void) {
+    static bool gemv_l1 = false;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        const char * env = getenv("GGML_CPU_TILED_MM_GEMVL1");
+        gemv_l1 = env != NULL && atoi(env) == 1;
+    });
+    return gemv_l1;
+}
+
+// GGML_CPU_TILED_MM_SLIDE: test/bench only, use the sliding 256-window GEMV for
+// M=1 / cne1=1: src1 decoded once into a compact buffer, src0 (q5_K) decoded on the fly
+// per 256-block, repeated full-length GEMV r-outer for contiguous weight reads. AVX2 only.
+static bool ggml_tiled_slide(void) {
+    static bool slide = false;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        const char * env = getenv("GGML_CPU_TILED_MM_SLIDE");
+        slide = env != NULL && atoi(env) == 1;
+    });
+    return slide;
 }
 
 // extended-K chunk extent: cap the tile's K so the hot working set (the 16 src0 rows +
@@ -786,6 +842,35 @@ static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_t
                                  expert_rows[2 * (k + m) + 1] * dst->nb[2]);
     }
 
+    // L1-resident GEMV (Driver C v2) for cne1=1: src1 unpacked once (L1-resident),
+    // src0 in 16 x 1024 windows. Test-only path. VNNI only.
+    if (nrows == 1 && ne00 <= TILED_EXT_MAX_K && n_src0 % TILED_MICRO == 0
+        && tiled_kernel_ext_available() && ggml_tiled_gemv_l1()) {
+        const int n_slabs_total = (int) (ne00 / TILED_TILE_K);
+        tiled_unpack_src1_q8_K_ext(rows, 1, &ws->src1, (int) ne00, n_slabs_total, 0);
+        for (int64_t ir0 = r; ir0 < r_end; ir0 += TILED_MICRO) {
+            const int n_rows = (int) MIN(TILED_MICRO, r_end - ir0);
+            alignas(64) float acc[TILED_MICRO] = { 0 };
+            for (int64_t k0 = 0; k0 < ne00; k0 += TILED_GEMV_L1_K) {
+                const int ke = (int) MIN(TILED_GEMV_L1_K, ne00 - k0);
+                const int n_slabs = ke / TILED_TILE_K;
+                const int kblk0 = (int) (k0 / TILED_TILE_K);
+                const int nb = ke / SUBBLK;
+                tiled_unpack_src0_ext<B>((const B *) (src0_cur + ir0 * src0->nb[1]), src0_stride,
+                    0, ke, n_slabs, &ws->src0, TILED_TILE_K / SUBBLK, kblk0);
+                tiled_postprocess_src0_ext<BIAS>(&ws->src0, ke, nb);
+                for (int slab = 0; slab < n_slabs; slab++) {
+                    tiled_run_gemv_l1<SUBBLK, HAS_MIN, BIAS>(ws->src0, ws->src1,
+                        slab, kblk0 + slab, acc, ke, (int) ne00);
+                }
+            }
+            for (int i = 0; i < n_rows; i++) {
+                col_ptrs[0][ir0 - r + i] = acc[i];
+            }
+        }
+        return;
+    }
+
     // Driver B/C (extended-K tile) for nrows in [1,16]: same structure as the dense path
     // (L1-capped K chunks, bit-identical global slab order). nrows=1 uses the 1x16 GEMV
     // kernel (Driver C); nrows in [2,16] uses the 16x16 MAC (Driver B). VNNI only; else
@@ -993,6 +1078,59 @@ static void ggml_compute_forward_mul_mat_tiled_one_chunk(
         const block_q8_K * rows[TILED_TILE_ROWS];
         for (int r = 0; r < n_src1; r++) {
             rows[r] = (const block_q8_K *) ((const char *) wdata + (iir1 + r) * src1_stride * src1_bs);
+        }
+
+        // L1-resident GEMV (Driver C v2): src1 unpacked once (L1-resident), src0 in
+        // 16 x 1024 windows. Test-only path (GGML_CPU_TILED_MM_GEMVL1). VNNI only.
+        if (n_src1 == 1 && ne00 <= TILED_EXT_MAX_K && ir0_end % TILED_MICRO == 0
+            && tiled_kernel_ext_available() && ggml_tiled_gemv_l1()) {
+            const int n_slabs_total = (int) (ne00 / TILED_TILE_K);
+            tiled_unpack_src1_q8_K_ext(rows, 1, &ws->src1, (int) ne00, n_slabs_total, 0);
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ir0 += TILED_MICRO) {
+                const int64_t ir0_end16 = MIN(ir0 + TILED_MICRO, ir0_end);
+                const int n_rows = (int) (ir0_end16 - ir0);
+                alignas(64) float acc[TILED_MICRO] = { 0 };
+                for (int64_t k0 = 0; k0 < ne00; k0 += TILED_GEMV_L1_K) {
+                    const int ke = (int) MIN(TILED_GEMV_L1_K, ne00 - k0);
+                    const int n_slabs = ke / TILED_TILE_K;
+                    const int kblk0 = (int) (k0 / TILED_TILE_K);
+                    const int nb = ke / SUBBLK;
+                    tiled_unpack_src0_ext<B>((const B *) (src0_row + ir0 * nb01), src0_stride,
+                        0, ke, n_slabs, &ws->src0, TILED_TILE_K / SUBBLK, kblk0);
+                    tiled_postprocess_src0_ext<BIAS>(&ws->src0, ke, nb);
+                    for (int slab = 0; slab < n_slabs; slab++) {
+                        tiled_run_gemv_l1<SUBBLK, HAS_MIN, BIAS>(ws->src0, ws->src1,
+                            slab, kblk0 + slab, acc, ke, (int) ne00);
+                    }
+                }
+                for (int i = 0; i < n_rows; i++) {
+                    ((float *) (dst_col + (ir0 + i) * nb0 + i11 * nb1))[0] = acc[i];
+                }
+            }
+            iir1 = iir1_end;
+            continue;
+        }
+
+        // sliding GEMV (q5_K weight x q8_K activation, 1 activation row): src1 decoded once
+        // into a compact buffer; src0 (q5_K) dequanted per weight row into a compact buffer,
+        // then the generic int8 MAC. r-outer over the weight rows for contiguous reads.
+        // Test-only (GGML_CPU_TILED_MM_SLIDE). AVX2 only. Fires only for the true M=1 case
+        // (the iir1 window is exactly one src1 row).
+        if (n_src1 == 1 && src0->type == GGML_TYPE_Q5_K && ne00 <= TILED_EXT_MAX_K
+            && tiled_kernel_slide_available() && ggml_tiled_slide()) {
+            constexpr int NB_Q5K = QK_K / 32;   // 8 subblocks of 32
+            decode_slide_src1(rows[0], (int) ne00, &ws->slide_s1);
+            const block_q5_K * src0_base = (const block_q5_K *) src0_row;
+            // M=1 dst is i-major f32; weight row ir0, col i11 is at dst_col + ir0*nb0 + i11*nb1
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ir0++) {
+                decode_slide_src0<block_q5_K, NB_Q5K>(src0_base + ir0 * src0_stride,
+                                                      (int) ne00, &ws->slide_w);
+                tiled_run_gemv_int8<32, true>(ws->slide_w, ws->slide_s1,
+                                              (float *) (dst_col + ir0 * nb0 + i11 * nb1),
+                                              (int) ne00);
+            }
+            iir1 = iir1_end;
+            continue;
         }
 
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += TILE) {

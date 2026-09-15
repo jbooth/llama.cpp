@@ -55,11 +55,37 @@ struct tiled_tile_src1 {
     float       d[TILED_TILE_ROWS];
 };
 
+// dequantized single weight row for the sliding GEMV: the driver dequants the weight quant
+// (q5_K for now) into this layout over the full K, one 256-block at a time; the generic
+// tiled_run_gemv_int8 MACs the dequantized codes. Quant-independent: code is the integer
+// part (the maddubs unsigned operand; 0..31 for q5_K), scales/mins are per-subblock
+// (indexed [block * NB + s], NB = 256/SUBBLK), d/dmin are per 256-block. k <= TILED_EXT_MAX_K.
+struct tiled_slide_w {
+    static constexpr int MAXK = TILED_EXT_MAX_K;
+    int8_t  code[MAXK];                 // [k] dequantized weight codes
+    float   d[MAXK / TILED_TILE_K];     // [k/256] per-block d
+    float   dmin[MAXK / TILED_TILE_K];  // [k/256] per-block dmin
+    int32_t scales[MAXK / 16];          // [block * NB + s] per-subblock scale (NB_MAX per block)
+    int32_t mins[MAXK / 16];            // [block * NB + s] per-subblock min
+};
+
+// dequantized single activation row for the sliding GEMV (q8_K): raw int8 codes (the
+// maddubs signed operand), per-32 code sums (the min term), per-block scale. Decoded once
+// (the activation is a single row). k <= TILED_EXT_MAX_K (the GEMV gate).
+struct tiled_slide_s1 {
+    static constexpr int MAXK = TILED_EXT_MAX_K;
+    int8_t  code[MAXK];                 // [k] raw q8 int8
+    int16_t bsums32[MAXK / 32];         // [k/32] per-32 activation code sum (min term)
+    float   d[MAXK / TILED_TILE_K];     // [k/256] per-block scale
+};
+
 // per-thread workspace: all tiled state lives here, allocated in wdata (one slot per thread)
 struct tiled_ws {
     tiled_tile_src0 src0;
     tiled_tile_src1 src1;
     alignas(64) float acc[TILED_TILE_ROWS * TILED_TILE_ROWS];
+    tiled_slide_w  slide_w;
+    tiled_slide_s1 slide_s1;
 };
 
 static_assert(sizeof(tiled_ws) <= 512 * 1024, "tiled workspace exceeds 512KB per-thread budget");
@@ -178,6 +204,22 @@ inline bool tiled_kernel_ext_available(void) {
 #endif
 }
 
+// the sliding GEMV (q5_K x q8_K, 1 activation row) is AVX2-only: q5_K has no
+// VNNI/dpbusd vec_dot, so the MAC is the natural-layout maddubs (std's MAC). The driver
+// gates on this before calling tiled_run_gemv_int8.
+inline bool tiled_kernel_slide_available(void) {
+#if defined(__AVX2__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+// L1-resident GEMV window: the src0 window (16 rows x TILED_GEMV_L1_K) and the full src1
+// (1 row x ne00) both fit in L1D. TILED_GEMV_L1_K = 1024 keeps 16 * 1024 + 4096 + ~5KB
+// side tables under 32KB.
+#define TILED_GEMV_L1_K 1024
+
 // Accumulate one 16x16 microtile (src0 rows [i0, i0+16), src1 cols [j0, j0+16))
 // over the full 256-K slab held in the tiles into a j-major float buffer
 // (row width buf_stride): buf[i*buf_stride + j] += partial.
@@ -203,6 +245,28 @@ template <int SUBBLK, bool HAS_MIN, int BIAS>
 void tiled_run_gemv_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                         int j0, float * buf, int buf_stride,
                         int k_extent, int slab_offset, int table_stride, int i0_buf);
+
+// L1-resident GEMV (Driver C v2): one 256-block of src0 (16 rows x 256 K) against the
+// L1-resident src1 (1 row x ne00, unpacked once). Accumulates into acc_f (16 float
+// outputs, persisted across K-windows by the caller). src0 row stride is k_extent_s0
+// (the window, typically 1024); src1 row stride is k_extent_s1 (ne00, the full reduction).
+// slab_local is the slab within the src0 window (for src0 d/bsums/scales); slab_s1 is
+// the absolute slab index (for src1 d/bsums). VNNI only.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_gemv_l1(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                       int slab_local, int slab_s1, void * acc_f,
+                       int k_extent_s0, int k_extent_s1);
+
+// generic int8 GEMV MAC (sliding GEMV): dot the dequantized weight row (w) against the
+// dequantized activation row (s1) over the full K. maddubs per subblock (weight codes are
+// the unsigned operand, activation the signed int8, so the product is exact - no +128
+// correction), scaled by the per-subblock weight scale, with the min term. Folded to float
+// per 256-block (std's accumulation order). Reads the dequantized layout (the driver filled
+// it); no quant-type knowledge. SUBBLK is the scale granularity, HAS_MIN selects the min
+// term. Writes one output (out[0]). AVX2 only (q5_K has no dpbusd vec_dot).
+template <int SUBBLK, bool HAS_MIN>
+void tiled_run_gemv_int8(const tiled_slide_w & w, const tiled_slide_s1 & s1,
+                         float * out, int k);
 
 // Interleave the natural [row][256] src0 codes in-place into the VNNI
 // group-local [kg][row][4] layout. No-op on non-VNNI builds.

@@ -279,6 +279,81 @@ static void tiled_run_gemv_vnni(const tiled_tile_src0 & src0, const tiled_tile_s
     _mm512_store_ps(p, _mm512_add_ps(_mm512_load_ps(p), _mm512_mul_ps(result, _mm512_set1_ps(src1.d[d_base + j0]))));
 }
 
+// L1-resident GEMV (Driver C v2): one 256-block of src0 (16 rows x 256 K) against the
+// L1-resident src1 (1 row x ne00). Same addressing as the ext GEMV, but src0 and src1
+// have different row strides (k_extent_s0 for the 1024-K window, k_extent_s1 for the
+// full ne00). The epilogue accumulates into acc_f (a __m512 of 16 float outputs) instead
+// of storing to buf; the caller persists acc_f across K-windows and writes it once per
+// 16-row weight window. Per-256-block epilogue (d0*d1 applied per block), so the result
+// is bit-identical to the per-slab GEMV.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+static void tiled_run_gemv_l1_vnni(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                   int slab_local, int slab_s1, __m512 * acc_f,
+                                   int k_extent_s0, int k_extent_s1) {
+    constexpr int NB = TILED_TILE_K / SUBBLK;
+    constexpr int NS = SUBBLK / 16;
+    constexpr int NG = SUBBLK / 4;
+
+    const int s16_s0 = slab_local * (TILED_TILE_K / 16); // src0 per-16 base (within the window)
+    const int s16_s1 = slab_s1 * (TILED_TILE_K / 16);    // src1 per-16 base (absolute)
+    const int d0_base = slab_local * TILED_MICRO;        // src0 d row base
+    const int d1_base = slab_s1 * TILED_MICRO;           // src1 d row base
+
+    __m512i s1_acc = _mm512_setzero_si512();
+    __m512i s2_acc = _mm512_setzero_si512();
+
+    for (int s = 0; s < NB; s++) {
+        __m512i acc[NG];
+        for (int g = 0; g < NG; g++) { acc[g] = _mm512_setzero_si512(); }
+
+        // src0 bsums (slab_local, 16-row table stride)
+        __m512i src0_bsums_16 = _mm512_load_si512((const __m512i *) &src0.bsums[(s16_s0 + s * NS) * TILED_MICRO + 0]);
+        for (int u = 1; u < NS; u++) {
+            src0_bsums_16 = _mm512_add_epi32(src0_bsums_16, _mm512_load_si512((const __m512i *) &src0.bsums[(s16_s0 + s * NS + u) * TILED_MICRO + 0]));
+        }
+        __m512i bias_16 = _mm512_mullo_epi32(src0_bsums_16, _mm512_set1_epi32(128));
+
+        for (int g = 0; g < NG; g++) {
+            const int kg = s * NG + g;
+            // src0: [kg%16 row][c_full chunk], row stride k_extent_s0 (i0 = 0)
+            const int c_full = slab_local * (TILED_TILE_K / (TILED_MICRO * 4)) + (kg / TILED_MICRO);
+            const __m512i src0_512 = _mm512_load_si512((const __m512i *) &src0.q[(kg % TILED_MICRO) * k_extent_s0 + c_full * (TILED_MICRO * 4)]);
+            // src1: 1 col (j0=0), row stride k_extent_s1, absolute slab
+            const uint32_t s1_u4 = *(const uint32_t *) &src1.q[0 * k_extent_s1 + slab_s1 * TILED_TILE_K + kg * 4];
+            const __m512i s1_bcast = _mm512_set1_epi32((int) s1_u4);
+            acc[g] = _mm512_dpbusd_epi32(acc[g], s1_bcast, src0_512);
+        }
+
+        __m512i acc0 = acc[0];
+        for (int g = 1; g < NG; g++) { acc0 = _mm512_add_epi32(acc0, acc[g]); }
+
+        // int correction + scale (src0 scales, slab_local)
+        const int s_full = slab_local * NB + s;
+        const __m512i scales_16 = _mm512_load_si512((const __m512i *) &src0.scales_t[s_full * TILED_MICRO + 0]);
+        s1_acc = _mm512_add_epi32(s1_acc, _mm512_mullo_epi32(_mm512_sub_epi32(acc0, bias_16), scales_16));
+
+        if constexpr (HAS_MIN) {
+            // src1 bsums (absolute slab, 16-row table stride, col 0)
+            int32_t sum = 0;
+            for (int u = 0; u < NS; u++) { sum += src1.bsums[(s16_s1 + s * NS + u) * TILED_MICRO + 0]; }
+            const __m512i mins_16 = _mm512_load_si512((const __m512i *) &src0.mins_t[s_full * TILED_MICRO + 0]);
+            s2_acc = _mm512_add_epi32(s2_acc, _mm512_mullo_epi32(mins_16, _mm512_set1_epi32(sum)));
+        }
+    }
+
+    // epilogue: accumulate into acc_f (no store to buf)
+    const __m512 d0_vec = _mm512_load_ps(&src0.d[d0_base + 0]);
+    __m512 f1 = _mm512_cvtepi32_ps(s1_acc);
+    __m512 result = _mm512_mul_ps(f1, d0_vec);
+    if constexpr (HAS_MIN) {
+        const __m512 dmin_vec = _mm512_load_ps(&src0.dmin[d0_base + 0]);
+        __m512 f2 = _mm512_cvtepi32_ps(s2_acc);
+        result = _mm512_fnmadd_ps(dmin_vec, f2, result);
+    }
+    const float d1 = src1.d[d1_base + 0];
+    *acc_f = _mm512_add_ps(*acc_f, _mm512_mul_ps(result, _mm512_set1_ps(d1)));
+}
+
 #endif // __AVX512VNNI__ && __AVX512VL__
 
 #if defined(__AVX2__)
@@ -435,6 +510,53 @@ static void tiled_run_microtile_avx2(const tiled_tile_src0 & src0, const tiled_t
         }
     }
 }
+
+// sliding GEMV MAC (AVX2 body): the driver dequants the weight row into tiled_slide_w and
+// the activation into tiled_slide_s1; this MACs the dequantized codes. maddubs per
+// subblock (weight codes are the unsigned operand, activation the signed int8, so the
+// product is exact - no +128 correction), scaled by the per-subblock weight scale, with the
+// min term (weight min x per-32 activation code sum). Folded to float per 256-block (std's
+// accumulation order). Reads the dequantized layout; no quant-type knowledge.
+// hsum of the 8 int32 lanes of a 256-bit vector (the per-subblock maddubs scale sum)
+static int32_t tiled_slide_hsum_i32_8(const __m256i a) {
+    const __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extractf128_si256(a, 1));
+    const __m128i hi64   = _mm_unpackhi_epi64(sum128, sum128);
+    const __m128i sum64  = _mm_add_epi32(hi64, sum128);
+    const __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+
+template <int SUBBLK, bool HAS_MIN>
+static void tiled_run_gemv_int8_avx2(const tiled_slide_w & w, const tiled_slide_s1 & s1,
+                                     float * out, int k) {
+    constexpr int NB = TILED_TILE_K / SUBBLK;   // subblocks per 256-block (8 for SUBBLK=32)
+    static_assert(SUBBLK == 32, "only SUBBLK=32 (q5_K) supported yet");
+    static_assert(NB * SUBBLK == TILED_TILE_K, "SUBBLK must divide TILED_TILE_K");
+    const int nb = k / TILED_TILE_K;
+    const int8_t  * cw = w.code;
+    const int8_t  * cs = s1.code;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const int32_t * scb = w.scales + b * NB;
+        const int32_t * mnb = w.mins   + b * NB;
+        const int16_t * abb = s1.bsums32 + b * NB;
+        const int8_t  * wcb = cw + b * TILED_TILE_K;
+        const int8_t  * acb = cs + b * TILED_TILE_K;
+        __m256i sumi = _mm256_setzero_si256();
+        int32_t mt = 0;
+        for (int s = 0; s < NB; s++) {
+            const __m256i wc = _mm256_loadu_si256((const __m256i *) (wcb + s * SUBBLK));
+            const __m256i ac = _mm256_loadu_si256((const __m256i *) (acb + s * SUBBLK));
+            __m256i p = _mm256_maddubs_epi16(wc, ac);
+            p = _mm256_madd_epi16(_mm256_set1_epi16((int16_t) scb[s]), p);
+            sumi = _mm256_add_epi32(sumi, p);
+            if constexpr (HAS_MIN) { mt += (int32_t) mnb[s] * (int32_t) abb[s]; }
+        }
+        acc += s1.d[b] * ( w.d[b] * (float) tiled_slide_hsum_i32_8(sumi)
+                          - (HAS_MIN ? w.dmin[b] * (float) mt : 0.0f) );
+    }
+    *out = acc;
+}
 #endif // __AVX2__
 
 #if defined(__AVX__) && !defined(__AVX2__)
@@ -575,6 +697,33 @@ void tiled_run_gemv_ext(const tiled_tile_src0 & src0, const tiled_tile_src1 & sr
 #endif
 }
 
+// L1-resident GEMV entry point (Driver C v2). VNNI only.
+template <int SUBBLK, bool HAS_MIN, int BIAS>
+void tiled_run_gemv_l1(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                       int slab_local, int slab_s1, void * acc_f,
+                       int k_extent_s0, int k_extent_s1) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    tiled_run_gemv_l1_vnni<SUBBLK, HAS_MIN, BIAS>(src0, src1, slab_local, slab_s1,
+                                                  (__m512 *) acc_f, k_extent_s0, k_extent_s1);
+#else
+    GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(slab_local); GGML_UNUSED(slab_s1);
+    GGML_UNUSED(acc_f); GGML_UNUSED(k_extent_s0); GGML_UNUSED(k_extent_s1);
+#endif
+}
+
+// sliding GEMV MAC entry point. The driver dequants the weight row into w (decode_slide_src0)
+// and the activation into s1 (decode_slide_src1), then calls this generic int8 MAC for each
+// weight row. AVX2 only; the driver gates on tiled_kernel_slide_available() before calling.
+template <int SUBBLK, bool HAS_MIN>
+void tiled_run_gemv_int8(const tiled_slide_w & w, const tiled_slide_s1 & s1,
+                         float * out, int k) {
+#if defined(__AVX2__)
+    tiled_run_gemv_int8_avx2<SUBBLK, HAS_MIN>(w, s1, out, k);
+#else
+    GGML_UNUSED(w); GGML_UNUSED(s1); GGML_UNUSED(out); GGML_UNUSED(k);
+#endif
+}
+
 // explicit instantiations for the in-use formats (q4_K and q5_K share the constants)
 template void tiled_run_microtile<32, true, 0>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, int n_cols, float * buf, int buf_stride);
@@ -613,6 +762,23 @@ TILED_GEMV_INST(16, false, 32)
 TILED_GEMV_INST(16, false, 4)
 TILED_GEMV_INST(16, true , 0)
 #undef TILED_GEMV_INST
+
+// L1-resident GEMV (Driver C v2), same format set
+#define TILED_GEMVL1_INST(SB, HM, BI) \
+    template void tiled_run_gemv_l1<SB, HM, BI>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1, \
+        int slab_local, int slab_s1, void * acc_f, int k_extent_s0, int k_extent_s1);
+TILED_GEMVL1_INST(32, true , 0)
+TILED_GEMVL1_INST(32, false, 128)
+TILED_GEMVL1_INST(16, false, 128)
+TILED_GEMVL1_INST(16, false, 32)
+TILED_GEMVL1_INST(16, false, 4)
+TILED_GEMVL1_INST(16, true , 0)
+#undef TILED_GEMVL1_INST
+
+
+// sliding GEMV int8 MAC (q5_K: SUBBLK=32, HAS_MIN=true)
+template void tiled_run_gemv_int8<32, true>(const tiled_slide_w & w, const tiled_slide_s1 & s1,
+                                            float * out, int k);
 
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
