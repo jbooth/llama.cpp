@@ -177,4 +177,15 @@ void tiled_repack_src1(tiled_tile_src1 * src1, int row0, int num_k, bool bias);
 template <int SUBBLK>
 void tiled_repack_src0(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, bool corr);
 
+// GEMV: one neuron (src0 row) x one 256-K slab. The src0 tile holds the weight row for all
+// slabs (1 row x num_k slabs, dequantized u8 codes; row 0, slab `slab` is what this call
+// reads: q at slab*256, scales/mins at slab*NB, d/dmin at slab*16); src1 is the token's
+// block_q8_K for that slab (qs = 256 signed i8 codes, bsums = 16 per-16 int16 sums, d = f32).
+// dst += src1->d * ( d0*s1_acc - dmin0*s2_acc ) where
+//   s1_acc = sum_s scales[s] * (raw_s - BIAS*bsum_s)
+//   s2_acc = sum_s mins[s]   * bsum_s        (HAS_MIN only)
+//   raw_s  = exact int dot of the weight row and the activation over subblock s
+template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+void tiled_gemm_1x1(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+
 

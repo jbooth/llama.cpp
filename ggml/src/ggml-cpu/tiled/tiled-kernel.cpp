@@ -716,4 +716,187 @@ void tiled_repack_src0(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, 
 template void tiled_repack_src0<16>(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, bool corr);
 template void tiled_repack_src0<32>(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, bool corr);
 
+// =====================================================================
+// GEMV (1x1) kernels: one neuron (weight row) x one 256-K slab. The src0
+// tile holds the weight row at row 0 slab 0 (dequantized u8 codes, scales/
+// mins/d/dmin at [0]); src1 is the token's block_q8_K (qs 256 signed i8,
+// bsums 16 per-16 int16, d f32). Algebra (per subblock s):
+//   raw_s = exact int dot of the weight row and the activation
+//   s1_acc += scales[s] * (raw_s - BIAS*bsum_s);  s2_acc += mins[s]*bsum_s (HAS_MIN)
+//   dst += src1->d * (d0*s1_acc - dmin0*s2_acc)
+// The BIAS != 0 AVX2/AVX path uses the sign trick for all types (Wmax <= 127
+// fits i16), so it needs no act-bias correction and no activation pre-bias
+// (the token's signed codes are used as-is).
+
+// sum 8 int16 (128-bit) to a scalar int32 (maddubs gives 8 i16 per 16 k)
+#if defined(__AVX2__) || defined(__AVX__)
+static int32_t tiled_hsum128_epi16(const __m128i v) {
+    const __m128i s = _mm_madd_epi16(v, _mm_set1_epi16(1)); // 4 int32 (pair sums)
+    const __m128i h = _mm_hadd_epi32(s, s);                 // 2 int32
+    return _mm_cvtsi128_si32(_mm_hadd_epi32(h, h));
+}
+#endif
+
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+// VNNI: dpbusd accumulates straight to i32 (no i16 overflow), so it always uses the base
+// int dot on the biased weight codes with the BIAS*bsums correction in the int domain
+// (the VNNI MAC, section 4.4). The 256-K slab is 4 chunks of 64 k; one dpbusd per chunk
+// gives 16 i32 lanes (16 groups of 4 k), folded into the (64/SUBBLK) subblock raw sums.
+template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void tiled_gemm_1x1_vnni(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab) {
+    GGML_UNUSED(ACTBIAS);
+    constexpr int NS = SUBBLK / 16;
+    constexpr int NB = TILED_TILE_K / SUBBLK;
+    constexpr int NCHUNK = TILED_TILE_K / 64; // 4 chunks of 64 k
+    constexpr int NSPB = 64 / SUBBLK;         // subblocks per 64-elem chunk
+    constexpr int NLANE_SB = SUBBLK / 4;      // dpbusd lanes per subblock
+
+    // row 0, slab `slab` in the multi-slab tile (1 row x num_k slabs, row stride num_k*256)
+    const uint8_t * q0 = src0.q + slab * TILED_TILE_K;
+    const int32_t * scales = src0.scales + slab * NB;
+    const int32_t * mins = src0.mins + slab * NB;
+    const float d0 = src0.d[slab * TILED_MICRO];
+    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const int8_t  * q1 = src1->qs; // 256 act codes (i8), natural [k] order
+
+    int32_t s1_acc = 0;
+    int32_t s2_acc = 0;
+
+    for (int c = 0; c < NCHUNK; c++) {
+        const __m512i p16 = _mm512_dpbusd_epi32(_mm512_setzero_si512(),
+            _mm512_loadu_si512((const __m512i *) (q0 + c * 64)),
+            _mm512_loadu_si512((const __m512i *) (q1 + c * 64)));
+        alignas(64) int32_t lane[16];
+        _mm512_store_si512(lane, p16);
+        for (int sp = 0; sp < NSPB; sp++) {
+            const int s = c * NSPB + sp;
+            int32_t raw = 0;
+            for (int l = sp * NLANE_SB; l < (sp + 1) * NLANE_SB; l++) {
+                raw += lane[l];
+            }
+            int32_t bsum = 0;
+            for (int u = 0; u < NS; u++) {
+                bsum += src1->bsums[s * NS + u];
+            }
+            if constexpr (BIAS != 0) {
+                raw -= BIAS * bsum;
+            }
+            s1_acc += scales[s] * raw;
+            if constexpr (HAS_MIN) {
+                s2_acc += mins[s] * bsum;
+            }
+        }
+    }
+    *dst += src1->d * (d0 * (float) s1_acc - dmin0 * (float) s2_acc);
+}
+#endif
+
+#if defined(__AVX2__) || defined(__AVX__)
+// AVX2/AVX: one 128-bit maddubs per 16-k group (8 i16 -> hsum). BIAS == 0 is the base int
+// dot (q0 u8 x q1 i8); BIAS != 0 uses the sign trick (w = q0 - BIAS, |w| and q1*sign(w),
+// one maddubs) so the true debiased dot comes out directly (no correction, Wmax <= 127).
+template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void tiled_gemm_1x1_avx2(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab) {
+    GGML_UNUSED(ACTBIAS);
+    constexpr int NB = TILED_TILE_K / SUBBLK;
+    constexpr int NS = SUBBLK / 16;
+    static_assert(NS == 1 || NS == 2, "GEMV AVX2/AVX subblock size");
+
+    const uint8_t * q0 = src0.q + slab * TILED_TILE_K;
+    const int32_t * scales = src0.scales + slab * NB;
+    const int32_t * mins = src0.mins + slab * NB;
+    const float d0 = src0.d[slab * TILED_MICRO];
+    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const int8_t  * q1 = src1->qs;
+
+    int32_t s1_acc = 0;
+    int32_t s2_acc = 0;
+
+    for (int s = 0; s < NB; s++) {
+        int32_t raw = 0;
+        if constexpr (BIAS == 0) {
+            for (int u = 0; u < NS; u++) {
+                raw += tiled_hsum128_epi16(_mm_maddubs_epi16(
+                    _mm_loadu_si128((const __m128i *) (q0 + s * SUBBLK + u * 16)),
+                    _mm_loadu_si128((const __m128i *) (q1 + s * SUBBLK + u * 16))));
+            }
+        } else {
+            for (int u = 0; u < NS; u++) {
+                const __m128i qw = _mm_loadu_si128((const __m128i *) (q0 + s * SUBBLK + u * 16));
+                const __m128i qv = _mm_loadu_si128((const __m128i *) (q1 + s * SUBBLK + u * 16));
+                const __m128i w = _mm_sub_epi8(qw, _mm_set1_epi8((int8_t) BIAS));
+                raw += tiled_hsum128_epi16(_mm_maddubs_epi16(_mm_sign_epi8(w, w), _mm_sign_epi8(qv, w)));
+            }
+        }
+        int32_t bsum = 0;
+        for (int u = 0; u < NS; u++) {
+            bsum += src1->bsums[s * NS + u];
+        }
+        s1_acc += scales[s] * raw;
+        if constexpr (HAS_MIN) {
+            s2_acc += mins[s] * bsum;
+        }
+    }
+    *dst += src1->d * (d0 * (float) s1_acc - dmin0 * (float) s2_acc);
+}
+#endif
+
+// scalar: the reference (plain int dot at subblock granularity), correct for all types
+template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void tiled_gemm_1x1_scalar(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab) {
+    GGML_UNUSED(ACTBIAS);
+    constexpr int NB = TILED_TILE_K / SUBBLK;
+    constexpr int NS = SUBBLK / 16;
+
+    const uint8_t * q0 = src0.q + slab * TILED_TILE_K;
+    const int32_t * scales = src0.scales + slab * NB;
+    const int32_t * mins = src0.mins + slab * NB;
+    const float d0 = src0.d[slab * TILED_MICRO];
+    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const int8_t  * q1 = src1->qs;
+
+    int32_t s1_acc = 0;
+    int32_t s2_acc = 0;
+
+    for (int s = 0; s < NB; s++) {
+        int32_t raw = 0;
+        for (int e = 0; e < SUBBLK; e++) {
+            raw += (int32_t) q0[s * SUBBLK + e] * (int32_t) q1[s * SUBBLK + e];
+        }
+        int32_t bsum = 0;
+        for (int u = 0; u < NS; u++) {
+            bsum += src1->bsums[s * NS + u];
+        }
+        if constexpr (BIAS != 0) {
+            raw -= BIAS * bsum;
+        }
+        s1_acc += scales[s] * raw;
+        if constexpr (HAS_MIN) {
+            s2_acc += mins[s] * bsum;
+        }
+    }
+    *dst += src1->d * (d0 * (float) s1_acc - dmin0 * (float) s2_acc);
+}
+
+// GEMV dispatch, mirrors the ISA selection of the GEMM MAC
+template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+void tiled_gemm_1x1(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
+    tiled_gemm_1x1_vnni<SUBBLK, HAS_MIN, BIAS, ACTBIAS>(src0, src1, dst, slab);
+#elif defined(__AVX2__) || defined(__AVX__)
+    tiled_gemm_1x1_avx2<SUBBLK, HAS_MIN, BIAS, ACTBIAS>(src0, src1, dst, slab);
+#else
+    tiled_gemm_1x1_scalar<SUBBLK, HAS_MIN, BIAS, ACTBIAS>(src0, src1, dst, slab);
+#endif
+}
+
+// explicit instantiations, same format set as the GEMM MAC (q4_K/q5_K aliased)
+template void tiled_gemm_1x1<32, true, 0, false>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<32, false, 128, false>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<32, false, 128, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<16, false, 128, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<16, false, 32, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<16, false, 4, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+template void tiled_gemm_1x1<16, true, 0, false>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+
 

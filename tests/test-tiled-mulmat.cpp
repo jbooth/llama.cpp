@@ -386,7 +386,20 @@ struct bench_row {
     float max_err_repack, rmse_repack;
     float max_err_tiled, rmse_tiled;
     bool have_repack;
+    double eff_bytes;   // DRAM bytes moved per op (weights + F32 act read + q8_K writeback)
 };
+
+// measured DRAM bandwidth ceiling (plan section 12, 8 threads on 1 CCD); override per machine.
+static double bench_dram_gbps(void) {
+    static double v = [] { const char * e = getenv("TILED_DRAM_GBS"); return e ? atof(e) : 49.6; }();
+    return v;
+}
+
+// % of DRAM bandwidth = bytes moved / time / ceiling. > 100% means pulling faster than DRAM
+// (L3-resident); the bench's flush evicts L3, so the large shapes read the weights cold.
+static double bench_pct_bw(double bytes, double t) {
+    return (bytes / t / (bench_dram_gbps() * 1e9)) * 100.0;
+}
 
 // MUL_MAT three-way bench: std (default optimized GEMM) vs repack (CPU_REPACK buffer) vs
 // tiled kernel. std is timed in-process with use_ref=true (bypasses the tiled gate); tiled
@@ -401,6 +414,9 @@ static bench_row bench_three_way(ggml_backend_t backend, int64_t M, int64_t N, i
 
     struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
     struct ggml_context * ctx = ggml_init(ip);
+
+    { const double bps = (double) ggml_type_size(quant_type) / ggml_blck_size(quant_type);
+      row.eff_bytes = (double) K * N * bps + (double) N * M * 4.0 + (double) N * M * 44.0 / 32.0; }
 
     struct ggml_tensor * src1     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, M);
     struct ggml_tensor * src0_std = ggml_new_tensor_2d(ctx, quant_type,  N, K);
@@ -485,24 +501,27 @@ static void print_bench_table(int64_t M, int64_t N, int64_t K, const bench_row *
 
     printf("\nBENCH dense %lldx%lld * %lldx%lld (std vs repack vs tiled), min of 5 timings, 8 threads\n",
            (long long)M, (long long)N, (long long)N, (long long)K);
-    printf("%-8s %10s %12s %12s %11s %11s %17s %17s %17s %17s\n",
+    printf("%-8s %10s %12s %12s %11s %11s %9s %9s %17s %17s %17s %17s\n",
            "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
+           "std %BW", "tiled %BW",
            "max_err(repack)", "rmse(repack)", "max_err(tiled)", "rmse(tiled)");
     for (size_t i = 0; i < n_types; ++i) {
         const bench_row * r = &rows[i];
         if (r->have_repack) {
-            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %17.5e %17.5e %17.5e %17.5e\n",
+            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %9.0f %9.0f %17.5e %17.5e %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    flops / (r->time_repack * 1e12), flops / (r->time_tiled * 1e12),
                    r->time_std / r->time_repack, r->time_std / r->time_tiled,
+                   bench_pct_bw(r->eff_bytes, r->time_std), bench_pct_bw(r->eff_bytes, r->time_tiled),
                    r->max_err_repack, r->rmse_repack, r->max_err_tiled, r->rmse_tiled);
         } else {
-            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %17s %17s %17.5e %17.5e\n",
+            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %9.0f %9.0f %17s %17s %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    "n/a", flops / (r->time_tiled * 1e12), "n/a",
                    r->time_std / r->time_tiled,
+                   bench_pct_bw(r->eff_bytes, r->time_std), bench_pct_bw(r->eff_bytes, r->time_tiled),
                    "n/a", "n/a", r->max_err_tiled, r->rmse_tiled);
         }
     }
@@ -514,6 +533,7 @@ struct bench_row_mmid {
     float max_err_repack, rmse_repack;
     float max_err_tiled, rmse_tiled;
     bool have_repack;
+    double eff_bytes;   // DRAM bytes moved per op (all experts' weights + F32 act read + q8_K writeback)
 };
 
 // MUL_MAT_ID (MoE) three-way bench: std (default GEMM, use_ref) vs repack (CPU_REPACK buffer)
@@ -535,6 +555,9 @@ static bench_row_mmid bench_mul_mat_id(ggml_backend_t backend, int64_t K, int64_
     int64_t ne_as[4]  = { K, R, n_experts, 1 };
     int64_t ne_b[4]   = { K, b_slots, batch, 1 };
     int64_t ne_ids[4] = { k, batch, 1, 1 };
+    { const double bps = (double) ggml_type_size(quant_type) / ggml_blck_size(quant_type);
+      row.eff_bytes = (double) n_experts * R * K * bps + (double) K * b_slots * batch * 4.0 + (double) K * b_slots * batch * 44.0 / 32.0; }
+
     struct ggml_tensor * src1     = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b);
     struct ggml_tensor * src0_std = ggml_new_tensor(ctx, quant_type,  4, ne_as);
     struct ggml_tensor * src0_rep = ggml_new_tensor(ctx, quant_type,  4, ne_as);
@@ -627,24 +650,27 @@ static void print_mmid_table(int64_t K, int64_t R, int64_t n_experts, int64_t k,
     printf("\nBENCH mmid %lldx%lldx%lld k=%lld b_slots=%lld batch=%lld (cne1=%lld, std vs repack vs tiled), min of 5 timings, 8 threads\n",
            (long long)K, (long long)R, (long long)n_experts, (long long)k,
            (long long)b_slots, (long long)batch, (long long)(k * batch / n_experts));
-    printf("%-8s %10s %12s %12s %11s %11s %17s %17s %17s %17s\n",
+    printf("%-8s %10s %12s %12s %11s %11s %9s %9s %17s %17s %17s %17s\n",
            "type", "std TF", "repack TF", "tiled TF", "repack/std", "tiled/std",
+           "std %BW", "tiled %BW",
            "max_err(repack)", "rmse(repack)", "max_err(tiled)", "rmse(tiled)");
     for (size_t i = 0; i < n_types; ++i) {
         const bench_row_mmid * r = &rows[i];
         if (r->have_repack) {
-            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %17.5e %17.5e %17.5e %17.5e\n",
+            printf("%-8s %10.3f %12.3f %12.3f %11.2f %11.2f %9.0f %9.0f %17.5e %17.5e %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    flops / (r->time_repack * 1e12), flops / (r->time_tiled * 1e12),
                    r->time_std / r->time_repack, r->time_std / r->time_tiled,
+                   bench_pct_bw(r->eff_bytes, r->time_std), bench_pct_bw(r->eff_bytes, r->time_tiled),
                    r->max_err_repack, r->rmse_repack, r->max_err_tiled, r->rmse_tiled);
         } else {
-            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %17s %17s %17.5e %17.5e\n",
+            printf("%-8s %10.3f %12s %12.3f %11s %11.2f %9.0f %9.0f %17s %17s %17.5e %17.5e\n",
                    r->name,
                    flops / (r->time_std * 1e12),
                    "n/a", flops / (r->time_tiled * 1e12), "n/a",
                    r->time_std / r->time_tiled,
+                   bench_pct_bw(r->eff_bytes, r->time_std), bench_pct_bw(r->eff_bytes, r->time_tiled),
                    "n/a", "n/a", r->max_err_tiled, r->rmse_tiled);
         }
     }
@@ -748,6 +774,26 @@ int main(int argc, char ** argv) {
         test_matmul(backend, 513, 1024, 513, GGML_TYPE_Q6_K);
         test_matmul(backend, 17, 512, 257, GGML_TYPE_Q6_K);
 
+        // GEMV (M = 1, single token): the dedicated 1x1 path. Per-type to exercise the sign
+        // trick / base dot constants; N = 1024 (4 slabs) and K = 256 (neurons) exercise the
+        // slab loop and the thread split
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_Q2_K);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_Q3_K);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_Q4_K);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_Q5_K);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_Q6_K);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ4_XS);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ2_XXS);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ2_XS);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ2_S);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ3_XXS);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ3_S);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ1_S);
+        test_matmul(backend, 1, 1024, 256, GGML_TYPE_IQ1_M);
+        // GEMV edges: single neuron (K = 1) and a long single-neuron K (20 slabs)
+        test_matmul(backend, 1,  256,   1, GGML_TYPE_IQ4_XS);
+        test_matmul(backend, 1, 5120,   1, GGML_TYPE_IQ2_XXS);
+
         // MUL_MAT_ID (MoE): K = reduction (tiled gate needs K % 256 == 0), R = output rows per expert,
         // k = top-k slots, b_slots = b rows (1 = broadcast MoE, k = i11-diverse gather), cne1 = k*batch/E
         test_mul_mat_id(backend,  512,  300,   4, 2, 1, 150, GGML_TYPE_Q4_K);  // ragged R, broadcast, cne1 = 75
@@ -795,6 +841,11 @@ int main(int argc, char ** argv) {
         test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q6_K); // 3D, tiled, q6_K
         test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q3_K); // 4D, tiled, q3_K
         test_matmul_highdim(backend, 1024, 1024, 1024, 2, 2, 2, 2, GGML_TYPE_Q2_K); // 4D, tiled, q2_K
+
+        // GEMV (M = 1) with a src1 batch (ne12/ne13 > 1): weights broadcast over the token batch
+        test_matmul_highdim(backend, 1, 1024, 256, 3, 1, 1, 1, GGML_TYPE_Q4_K);  // broadcast r2 = 3
+        test_matmul_highdim(backend, 1, 1024, 256, 1, 2, 1, 1, GGML_TYPE_Q4_K);  // broadcast r3 = 2
+        test_matmul_highdim(backend, 1, 1024, 256, 2, 2, 1, 1, GGML_TYPE_IQ4_XS); // 4D GEMV, sign trick
     }
 
 
@@ -809,13 +860,15 @@ int main(int argc, char ** argv) {
         const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
 
         struct { int64_t M, N, K; } shapes[] = {
-            { 4096, 4096, 4096 },
-            { 4096, 4096,   64 },
-            { 4096, 4096,   32 },
-            { 4096, 4096,   24 },
-            { 4096, 4096,   16 },
-            { 4096, 4096,   8 },
-            { 4096, 4096,   1 },
+//            { 4096, 4096, 4096 },
+//            { 4096, 4096,   64 },
+//            { 4096, 4096,   32 },
+            // { 4096, 4096,   24 },
+            // { 4096, 4096,   16 },
+            // { 4096, 4096,   8 },
+            // { 4096, 4096,   1 },   // (transposed GEMV, dense driver; not the GEMV path)
+            {    1, 1024, 1024 },   // GEMV: 1 token, 1024 neurons, 1024 hidden (my tiled_gemm_1x1 path)
+            {    1, 4096, 4096 },   // GEMV: 1 token, 4096 neurons, 4096 hidden
         };
         for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
             bench_row rows[n_types];
@@ -828,13 +881,13 @@ int main(int argc, char ** argv) {
         // MUL_MAT_ID (MoE): K must be a multiple of 256 (the tiled slab). cne1 = k*batch/E.
         struct { int64_t K, R, E, k, b_slots, batch; } mmid_shapes[] = {
             { 1024, 1024,  8,   8, 1,    1 },  // cne1 = 1, single-token decode
-            { 1024, 1024,  4,   2, 1,   16 },  // cne1 = 8, narrow path
-            { 1024, 1024,  4,   2, 1,   32 },  // cne1 = 16, narrow path
-            {  512,  512,  8,   2, 1,  128 },  // cne1 = 32
-            { 1024, 1024, 16,   8, 1,   64 },  // cne1 = 32
-            { 1024, 1024, 16,   8, 1,  256 },  // cne1 = 128
-            { 1024, 2048, 32,   8, 1,  512 },  // cne1 = 128, wide experts
-            { 2048, 1024, 16,   8, 1, 1024 },  // cne1 = 512, long dot
+  //          { 1024, 1024,  4,   2, 1,   16 },  // cne1 = 8, narrow path
+  //          { 1024, 1024,  4,   2, 1,   32 },  // cne1 = 16, narrow path
+  //          {  512,  512,  8,   2, 1,  128 },  // cne1 = 32
+  //          { 1024, 1024, 16,   8, 1,   64 },  // cne1 = 32
+  //          { 1024, 1024, 16,   8, 1,  256 },  // cne1 = 128
+  //          { 1024, 2048, 32,   8, 1,  512 },  // cne1 = 128, wide experts
+  //          { 2048, 1024, 16,   8, 1, 1024 },  // cne1 = 512, long dot
         };
         for (size_t s = 0; s < sizeof(mmid_shapes) / sizeof(mmid_shapes[0]); ++s) {
             bench_row_mmid rows[n_types];

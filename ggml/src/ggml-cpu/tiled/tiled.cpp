@@ -1143,6 +1143,179 @@ static void ggml_compute_forward_mul_mat_tiled_driver(
     }
 }
 
+// GEMV core: one token x a contiguous range of neurons [i0, i1). wbase = the weights (all
+// slabs, contiguous per neuron); src0_stride = blocks between weight rows; act = the token's
+// q8_K; dst_col[i] = the output for neuron i. Each neuron's weight is unpacked as a long
+// contiguous stream (up to MAXSLAB slabs per pass, one ~2304B read for q4_K) so the prefetcher
+// keeps many weight blocks in flight, then the MAC reads the L1 tile per slab. A software
+// _mm_prefetch ahead (any lookahead/window) measured slower than this long read; see tiled-plan.md.
+// Shared by the dense and the MUL_MAT_ID (cne1 == 1) GEMV drivers.
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void tiled_gemv_neurons(const B * wbase, int64_t n_slabs, int64_t src0_stride,
+                               const block_q8_K * act, float * dst_col,
+                               int64_t i0, int64_t i1, tiled_ws * ws) {
+    constexpr int64_t MAXSLAB = TILED_TILE_ROWS / TILED_MICRO;
+
+    for (int64_t i = i0; i < i1; i++) {
+        const B * wrow = wbase + (size_t) i * src0_stride;
+        float acc = 0.0f;
+        for (int64_t k0 = 0; k0 < n_slabs; k0 += MAXSLAB) {
+            const int nk = (int) MIN(MAXSLAB, n_slabs - k0);
+            tiled_unpack_src0(wrow + k0, src0_stride, 1, &ws->src0, nk);
+            for (int64_t k = 0; k < nk; k++) {
+                tiled_gemm_1x1<SUBBLK, HAS_MIN, BIAS, ACTBIAS>(ws->src0, act + k0 + k, &acc, (int) k);
+            }
+        }
+        dst_col[i] = acc;
+    }
+}
+
+// GEMV (tokens == 1): each thread owns a contiguous range of neuron rows; for each neuron it
+// streams the full reduction in 256-K slabs (weight rows in contiguous order to feed the
+// prefetcher) and dots against the single token's q8_K (read directly from the block, no
+// panel). One slab per kernel call. Shares the F32->q8_K conversion with the GEMM paths.
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void ggml_compute_forward_mul_mat_tiled_gemv(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    enum ggml_type      const vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+    ggml_from_float_t   const from_float   = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+
+    GGML_ASSERT(ne11 == 1);   // single token (the GEMV decode case)
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+    GGML_ASSERT(ne00 % TILED_TILE_K == 0);
+    assert(ne12 % ne02 == 0);
+    assert(ne13 % ne03 == 0);
+
+    const size_t src0_bs = ggml_type_size(src0->type);
+
+    // F32 -> q8_K conversion (threaded over the K-blocks), identical to the dense driver
+    char * wdata = (char *) params->wdata;
+    if (src1->type != vec_dot_type) {
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1*ne11;
+        const size_t nbw3 = nbw2*ne12;
+
+        assert(params->wsize >= ne13*nbw3);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    size_t bs = ggml_blck_size(vec_dot_type);
+                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    from_float((float *)((char *) src1->data + i13*src1->nb[3] + i12*src1->nb[2] + i11*src1->nb[1] + ne10_block_start*bs*src1->nb[0]),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
+                }
+            }
+        }
+    }
+
+    // per-thread workspace slot (after any converted src1 in wdata), 64B-aligned
+    char * ws_base = wdata;
+    if (src1->type != vec_dot_type) {
+        ws_base += GGML_PAD(ggml_row_size(vec_dot_type, ggml_nelements(src1)), 64);
+    }
+    ws_base = (char *) (((uintptr_t) ws_base + 63) & ~(uintptr_t) 63);
+    tiled_ws * ws = (tiled_ws *) (ws_base + (size_t) ith * ggml_tiled_ws_size());
+
+    // the single token's q8_K: in wdata (F32 src1) or src1->data (native q8_K), contiguous
+    const void * act_base = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t src1_bs = ggml_type_size(vec_dot_type);
+    const int64_t src1_stride = (src1->type == vec_dot_type ? src1->nb[1] : ggml_row_size(vec_dot_type, ne10)) / src1_bs;
+
+    const int64_t n_slabs = ne00 / TILED_TILE_K;
+    const int64_t i0_start = (ne01 * ith) / nth;
+    const int64_t i0_end   = (ne01 * (ith + 1)) / nth;
+
+    // broadcast factors: the src0 (weights) batch is broadcast over the src1 (token) batch
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    ggml_barrier(params->threadpool);  // the conversion is done before any thread reads act
+
+    // token batch outer, neuron-outer, slab-inner
+    for (int64_t i13 = 0; i13 < ne13; ++i13) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            const block_q8_K * act = (const block_q8_K *) ((const char *) act_base + (i13 * ne12 + i12) * ne11 * src1_stride * src1_bs);
+            const char * src0_base = (const char *) src0->data + (i12 / r2) * src0->nb[2] + (i13 / r3) * src0->nb[3];
+            char * dst_base = (char *) dst->data + i12 * nb2 + i13 * nb3;
+
+            tiled_gemv_neurons<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>((const B *) src0_base, n_slabs, nb01 / src0_bs, act, (float *) dst_base, i0_start, i0_end, ws);
+        }
+    }
+}
+
+// MUL_MAT_ID GEMV (cne1 == 1): one expert has exactly one routed row (one token), so its whole
+// compute is a GEMV. The F32->q8_K conversion and the barrier are global (ggml-cpu.c, before
+// the expert loop), so the activation is already q8_K in wdata (or src1->data if native); each
+// thread owns a neuron range and dots against the single token, scattering the result row.
+template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
+static void ggml_compute_forward_mul_mat_id_tiled_gemv(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor *         dst,
+        int64_t                            cur_a,
+        const int32_t *                    expert_rows,
+        char *                             scratch) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const enum ggml_type vec_dot_type = ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+
+    const size_t src0_bs = ggml_type_size(src0->type);
+    const int64_t n_slabs = ne00 / TILED_TILE_K;
+    const int64_t src0_stride = nb01 / src0_bs;
+
+    // cne1 == 1: exactly one routed row (one token) for this expert. The dst column is indexed
+    // by the raw ids dim-1 value (n_expert_used); the activation row is indexed by it mod the
+    // (possibly broadcast) src1 dim-1 (one_expert's col_ptrs / rows[] do the same)
+    const int64_t i_dst = expert_rows[0];
+    const int64_t i11   = expert_rows[0] % ne11;
+    const int64_t i12   = expert_rows[1];
+
+    const block_q8_K * act;
+    if (src1->type == vec_dot_type) {
+        act = (const block_q8_K *) ((const char *) src1->data + i11 * src1->nb[1] + i12 * src1->nb[2]);
+    } else {
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        act = (const block_q8_K *) ((const char *) params->wdata + (i11 + (int64_t) i12 * ne11) * row_size);
+    }
+    float * dst_col = (float *) ((char *) dst->data + i_dst * dst->nb[1] + i12 * dst->nb[2]);
+
+    // one expert's weights
+    const B * wbase = (const B *) ((const char *) src0->data + cur_a * src0->nb[2]);
+
+    // per-thread workspace slot (the conversion is global, so scratch starts at the slots)
+    tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());
+
+    const int64_t i0_start = (ne01 * ith) / nth;
+    const int64_t i0_end   = (ne01 * (ith + 1)) / nth;
+
+    tiled_gemv_neurons<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(wbase, n_slabs, src0_stride, act, dst_col, i0_start, i0_end, ws);
+}
+
 // src0 type dispatch, shared by the MUL_MAT and MUL_MAT_ID entries: one expert for
 // MUL_MAT_ID (expert_rows != NULL), the full op for MUL_MAT
 template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
@@ -1153,9 +1326,20 @@ static bool tiled_matmul_dispatch(const struct ggml_compute_params * params,
                                   int64_t cne1,
                                   char * scratch) {
     if (expert_rows == NULL) {
-        ggml_compute_forward_mul_mat_tiled_driver<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst);
+        // dense: one token (src1->ne[1] == 1) is the GEMV path, otherwise the driver
+        if (dst->src[1]->ne[1] == 1) {
+            ggml_compute_forward_mul_mat_tiled_gemv<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst);
+        } else {
+            ggml_compute_forward_mul_mat_tiled_driver<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst);
+        }
     } else {
-        ggml_compute_forward_mul_mat_id_tiled_one_expert<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst, cur_a, cne1, expert_rows, scratch);
+        // MUL_MAT_ID: one routed row per expert (cne1 == 1) is a GEMV, otherwise the one_expert
+        // path (narrow GEMM for small cne1)
+        if (cne1 == 1) {
+            ggml_compute_forward_mul_mat_id_tiled_gemv<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst, cur_a, expert_rows, scratch);
+        } else {
+            ggml_compute_forward_mul_mat_id_tiled_one_expert<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst, cur_a, cne1, expert_rows, scratch);
+        }
     }
     return true;
 }
@@ -1200,8 +1384,9 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
 }
 
 static bool ggml_tiled_min_batch(int64_t rows) {
-    //  Profitable at rows >= 8, take even when unprofitable if we're forced
-    return rows >= 8 || ggml_tiled_matmul_forced();
+    // GEMV (rows == 1) and rows >= 8 are profitable; rows 2..7 are declined to stock until
+    // the 8x8 MAC lands; take even when unprofitable if we're forced
+    return rows == 1 || rows >= 8 || ggml_tiled_matmul_forced();
 }
 
 // tiled K-quant matmul; returns true if the op was computed here,
