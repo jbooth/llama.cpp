@@ -3,6 +3,8 @@
 #include "tiled-kernel.h"
 
 #include "ggml.h"
+#include "tiled_unpack.h"
+#include "simd-mappings.h"
 
 #include <cstring>
 
@@ -758,7 +760,7 @@ static void tiled_gemm_1x1_vnni(const tiled_tile_src0 & src0, const block_q8_K *
     const int32_t * scales = src0.scales + slab * NB;
     const int32_t * mins = src0.mins + slab * NB;
     const float d0 = src0.d[slab * TILED_MICRO];
-    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const float dmin0 = HAS_MIN ? src0.dmin[slab * TILED_MICRO] : 0.0f;
     const int8_t  * q1 = src1->qs;
 
     int32_t s1_acc = 0;
@@ -830,7 +832,7 @@ static void tiled_gemm_1x1_avx2(const tiled_tile_src0 & src0, const block_q8_K *
     const int32_t * scales = src0.scales + slab * NB;
     const int32_t * mins = src0.mins + slab * NB;
     const float d0 = src0.d[slab * TILED_MICRO];
-    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const float dmin0 = HAS_MIN ? src0.dmin[slab * TILED_MICRO] : 0.0f;
     const int8_t  * q1 = src1->qs;
 
     int32_t s1_acc = 0;
@@ -888,7 +890,6 @@ static void tiled_gemm_1x1_avx2(const tiled_tile_src0 & src0, const block_q8_K *
             s2_acc += mins[s] * bsum;
         }
     }
-
     *dst += src1->d * (d0 * (float) s1_acc - dmin0 * (float) s2_acc);
 }
 #endif
@@ -904,7 +905,7 @@ static void tiled_gemm_1x1_scalar(const tiled_tile_src0 & src0, const block_q8_K
     const int32_t * scales = src0.scales + slab * NB;
     const int32_t * mins = src0.mins + slab * NB;
     const float d0 = src0.d[slab * TILED_MICRO];
-    const float dmin0 = src0.dmin[slab * TILED_MICRO];
+    const float dmin0 = HAS_MIN ? src0.dmin[slab * TILED_MICRO] : 0.0f;
     const int8_t  * q1 = src1->qs;
 
     int32_t s1_acc = 0;
@@ -950,3 +951,194 @@ template void tiled_gemm_1x1<16, false, 128, true>(const tiled_tile_src0 & src0,
 template void tiled_gemm_1x1<16, false, 32, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
 template void tiled_gemm_1x1<16, false, 4, true>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
 template void tiled_gemm_1x1<16, true, 0, false>(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+
+
+// =====================================================================
+// GEMV: one neuron x full K, unified kernel with constexpr-governed variants.
+//
+// Architecture:
+//   - One kernel tiled_gemv_row<B, SUBBLK, BIAS, HAS_MIN> (single definition)
+//   - Per-type decode via tiled_gemv_scales_and_mins + tiled_unpk_q64<G>
+//   - if constexpr selects MAC structure (SUBBLK) and correction (HAS_MIN/BIAS)
+//
+// MAC structure per 256-K slab:
+//   SUBBLK=32 (q4_K, q5_K): 4 groups of 64, single-scale via vpshufb broadcast
+//   SUBBLK=16 (q6_K, q2_K, q3_K): 8 groups of 32, dual-scale via inserti128
+//
+// maddubs(code, act) + madd_epi16(scale) for the MAC.
+
+#if defined(__AVX2__)
+
+static const uint8_t k_scale_shuffle[8][32] = {
+    {  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1,  0, 1},
+    {  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3,  2, 3},
+    {  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5,  4, 5},
+    {  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7,  6, 7},
+    {  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9,  8, 9},
+    {10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11, 10,11},
+    {12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13, 12,13},
+    {14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15, 14,15},
+};
+
+template <typename B, int SUBBLK, int BIAS, bool HAS_MIN>
+static float tiled_gemv_row(const B * w, const block_q8_K * act, int n_slabs) {
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    for (int b = 0; b < n_slabs; b++) {
+        const B & x = w[b];
+        const block_q8_K & y = act[b];
+
+        int16_t sc[16], mn[16];
+        float d_raw, dmin_raw;
+        tiled_gemv_scales_and_mins(x, sc, mn, &d_raw, &dmin_raw);
+
+        const float d = y.d * d_raw;
+        const float dmin = HAS_MIN ? (-y.d * dmin_raw) : d;
+
+        __m256i sumi = _mm256_setzero_si256();
+        const int8_t * a = y.qs;
+
+        if constexpr (SUBBLK == 32) {
+            const __m256i scales = _mm256_broadcastsi128_si256(
+                _mm_loadu_si128((const __m128i *) sc));
+            int8_t lo[32], hi[32];
+            if constexpr (BIAS > 64) {
+                // sign trick: biased codes overflow maddubs (2*255*127 > 32767)
+                #define GEMV_MAC32B(G) \
+                    tiled_unpk_q64<G>(x, lo, hi); \
+                    { \
+                        __m256i lw = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *) lo), _mm256_set1_epi8((int8_t) BIAS)); \
+                        __m256i hw = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *) hi), _mm256_set1_epi8((int8_t) BIAS)); \
+                        __m256i al = _mm256_loadu_si256((const __m256i *) (a + G*64)); \
+                        __m256i ah = _mm256_loadu_si256((const __m256i *) (a + G*64 + 32)); \
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                            _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *) k_scale_shuffle[2*G])), \
+                            _mm256_maddubs_epi16(_mm256_sign_epi8(lw, lw), _mm256_sign_epi8(al, lw)))); \
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                            _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *) k_scale_shuffle[2*G+1])), \
+                            _mm256_maddubs_epi16(_mm256_sign_epi8(hw, hw), _mm256_sign_epi8(ah, hw)))); \
+                    }
+                GEMV_MAC32B(0)
+                GEMV_MAC32B(1)
+                GEMV_MAC32B(2)
+                GEMV_MAC32B(3)
+                #undef GEMV_MAC32B
+            } else {
+                // biased codes (BIAS == 0 or small BIAS where maddubs does not overflow)
+                #define GEMV_MAC32(G) \
+                    tiled_unpk_q64<G>(x, lo, hi); \
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                        _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *) k_scale_shuffle[2*G])), \
+                        _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *) lo), \
+                                             _mm256_loadu_si256((const __m256i *) (a + G*64))))); \
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                        _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *) k_scale_shuffle[2*G+1])), \
+                        _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *) hi), \
+                                             _mm256_loadu_si256((const __m256i *) (a + G*64 + 32)))));
+                GEMV_MAC32(0)
+                GEMV_MAC32(1)
+                GEMV_MAC32(2)
+                GEMV_MAC32(3)
+                #undef GEMV_MAC32
+            }
+        } else {
+            int8_t code[32];
+            if constexpr (BIAS > 64) {
+                // sign trick: biased codes overflow maddubs
+                #define GEMV_MAC16B(G) \
+                    tiled_unpk_q64<G>(x, code); \
+                    { \
+                        __m256i cw = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *) code), _mm256_set1_epi8((int8_t) BIAS)); \
+                        __m256i ac = _mm256_loadu_si256((const __m256i *) (a + G*32)); \
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                            _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi16(sc[2*G])), \
+                                                    _mm_set1_epi16(sc[2*G+1]), 1), \
+                            _mm256_maddubs_epi16(_mm256_sign_epi8(cw, cw), _mm256_sign_epi8(ac, cw)))); \
+                    }
+                GEMV_MAC16B(0)
+                GEMV_MAC16B(1)
+                GEMV_MAC16B(2)
+                GEMV_MAC16B(3)
+                GEMV_MAC16B(4)
+                GEMV_MAC16B(5)
+                GEMV_MAC16B(6)
+                GEMV_MAC16B(7)
+                #undef GEMV_MAC16B
+            } else {
+                // biased codes (BIAS == 0 or small BIAS)
+                #define GEMV_MAC16(G) \
+                    tiled_unpk_q64<G>(x, code); \
+                    sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16( \
+                        _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi16(sc[2*G])), \
+                                                _mm_set1_epi16(sc[2*G+1]), 1), \
+                        _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *) code), \
+                                             _mm256_loadu_si256((const __m256i *) (a + G*32)))));
+                GEMV_MAC16(0)
+                GEMV_MAC16(1)
+                GEMV_MAC16(2)
+                GEMV_MAC16(3)
+                GEMV_MAC16(4)
+                GEMV_MAC16(5)
+                GEMV_MAC16(6)
+                GEMV_MAC16(7)
+                #undef GEMV_MAC16
+            }
+        }
+
+        float min_sum = 0.0f;
+        if constexpr (HAS_MIN || (BIAS != 0 && BIAS <= 64)) {
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i *) y.bsums);
+            if constexpr (SUBBLK == 32) {
+                const __m128i q8s = _mm_hadd_epi16(
+                    _mm256_castsi256_si128(q8sums),
+                    _mm256_extracti128_si256(q8sums, 1));
+                const int16_t * corr = HAS_MIN ? mn : sc;
+                const __m128 ps = _mm_cvtepi32_ps(
+                    _mm_madd_epi16(_mm_loadu_si128((const __m128i *) corr), q8s));
+                const float factor = HAS_MIN ? 1.0f : (-((float) BIAS));
+                min_sum = factor * (_mm_cvtss_f32(ps) + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,1))
+                                  + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,2)) + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,3)));
+            } else {
+                const int16_t * corr = HAS_MIN ? mn : sc;
+                const __m128 ps = _mm_cvtepi32_ps(_mm_add_epi32(
+                    _mm_madd_epi16(_mm_loadu_si128((const __m128i *) corr),
+                                   _mm256_castsi256_si128(q8sums)),
+                    _mm_madd_epi16(_mm_loadu_si128((const __m128i *)(corr + 8)),
+                                   _mm256_extracti128_si256(q8sums, 1))));
+                const float factor = HAS_MIN ? 1.0f : (-((float) BIAS));
+                min_sum = factor * (_mm_cvtss_f32(ps) + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,1))
+                                  + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,2)) + _mm_cvtss_f32(_mm_shuffle_ps(ps,ps,3)));
+            }
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        if (dmin != 0.0f) {
+            acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_set_ss(min_sum), acc_m);
+        }
+    }
+
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+    __m128 res = _mm256_extractf128_ps(acc, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res) + _mm_cvtss_f32(acc_m);
+}
+
+// explicit instantiations
+template float tiled_gemv_row<block_q4_K, 32, 0, true>(const block_q4_K * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_q5_K, 32, 0, true>(const block_q5_K * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_q6_K, 16, 32, false>(const block_q6_K * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_q2_K, 16, 0, true>(const block_q2_K * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_q3_K, 16, 4, false>(const block_q3_K * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq4_xs, 32, 128, false>(const block_iq4_xs * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq2_xxs, 32, 128, false>(const block_iq2_xxs * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq2_xs, 16, 128, false>(const block_iq2_xs * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq2_s, 16, 128, false>(const block_iq2_s * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq3_xxs, 32, 128, false>(const block_iq3_xxs * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq3_s, 32, 128, false>(const block_iq3_s * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq1_s, 32, 128, false>(const block_iq1_s * w, const block_q8_K * act, int n_slabs);
+template float tiled_gemv_row<block_iq1_m, 16, 128, false>(const block_iq1_m * w, const block_q8_K * act, int n_slabs);
+#endif  // __AVX2__

@@ -881,6 +881,7 @@ int main(int argc, char ** argv) {
         // MUL_MAT_ID (MoE): K must be a multiple of 256 (the tiled slab). cne1 = k*batch/E.
         struct { int64_t K, R, E, k, b_slots, batch; } mmid_shapes[] = {
             { 1024, 1024,  8,   8, 1,    1 },  // cne1 = 1, single-token decode
+            { 4096, 1024,  8,   8, 1,    1 },  // cne1 = 1, K=4096 (16 slabs)
   //          { 1024, 1024,  4,   2, 1,   16 },  // cne1 = 8, narrow path
   //          { 1024, 1024,  4,   2, 1,   32 },  // cne1 = 16, narrow path
   //          {  512,  512,  8,   2, 1,  128 },  // cne1 = 32

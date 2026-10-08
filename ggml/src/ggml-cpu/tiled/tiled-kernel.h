@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <cstring>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -187,6 +188,12 @@ void tiled_repack_src0(tiled_tile_src0 * tile, int n_rows, int num_k, int BIAS, 
 //   raw_s  = exact int dot of the weight row and the activation over subblock s
 template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
 void tiled_gemm_1x1(const tiled_tile_src0 & src0, const block_q8_K * src1, float * dst, int slab);
+
+// GEMV: one neuron x full K, unified kernel with constexpr-governed variants.
+// B = block type, SUBBLK = 32 or 16, BIAS = code offset, HAS_MIN = separate min field.
+// Returns the dot product for one neuron over all n_slabs 256-K blocks.
+template <typename B, int SUBBLK, int BIAS, bool HAS_MIN>
+float tiled_gemv_row(const B * w, const block_q8_K * act, int n_slabs);
 
 
 
